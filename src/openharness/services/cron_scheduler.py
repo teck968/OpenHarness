@@ -270,6 +270,18 @@ async def _notify_job_result(job: dict[str, Any], entry: dict[str, Any]) -> None
                 content=_format_notification(job, entry),
                 workspace=str(workspace) if workspace else None,
             )
+        elif notify_type in {"feishu_chat", "feishu_group"}:
+            from ohmo.gateway.notify import send_feishu_chat
+
+            chat_id = str(notify.get("chat_id") or notify.get("to") or "").strip()
+            if not chat_id:
+                raise ValueError("missing notify.chat_id")
+            workspace = notify.get("workspace")
+            await send_feishu_chat(
+                chat_id=chat_id,
+                content=_format_notification(job, entry),
+                workspace=str(workspace) if workspace else None,
+            )
         elif notify_type:
             raise ValueError(f"unsupported notify.type: {notify_type}")
     except Exception as exc:

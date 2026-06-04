@@ -35,8 +35,14 @@ def _chunk_text(text: str, *, max_chars: int = 1800) -> list[str]:
     return chunks
 
 
-def _send_feishu_text_sync(*, user_open_id: str, content: str, workspace: str | Path | None = None) -> None:
-    """Send a Feishu direct message using ohmo gateway Feishu credentials."""
+def _send_feishu_text_sync(
+    *,
+    user_open_id: str | None = None,
+    chat_id: str | None = None,
+    content: str,
+    workspace: str | Path | None = None,
+) -> None:
+    """Send a Feishu text message using ohmo gateway Feishu credentials."""
     try:
         import lark_oapi as lark
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -50,14 +56,20 @@ def _send_feishu_text_sync(*, user_open_id: str, content: str, workspace: str | 
     if not app_id or not app_secret:
         raise OhmoNotificationError("Feishu app_id/app_secret are not configured in ohmo gateway config.")
 
+    receive_id = (chat_id or user_open_id or "").strip()
+    if not receive_id:
+        raise OhmoNotificationError("missing Feishu receive id")
+    receive_id_type = "chat_id" if chat_id else "open_id"
+    target_kind = "chat" if chat_id else "DM"
+
     client = lark.Client.builder().app_id(app_id).app_secret(app_secret).log_level(lark.LogLevel.INFO).build()
     for chunk in _chunk_text(content):
         request = (
             CreateMessageRequest.builder()
-            .receive_id_type("open_id")
+            .receive_id_type(receive_id_type)
             .request_body(
                 CreateMessageRequestBody.builder()
-                .receive_id(user_open_id)
+                .receive_id(receive_id)
                 .msg_type("text")
                 .content(json.dumps({"text": chunk}, ensure_ascii=False))
                 .build()
@@ -68,7 +80,7 @@ def _send_feishu_text_sync(*, user_open_id: str, content: str, workspace: str | 
         if not response.success():
             log_id = response.get_log_id() if hasattr(response, "get_log_id") else ""
             raise OhmoNotificationError(
-                f"send Feishu DM failed: code={response.code}, msg={response.msg}, log_id={log_id}"
+                f"send Feishu {target_kind} failed: code={response.code}, msg={response.msg}, log_id={log_id}"
             )
 
 
@@ -76,3 +88,9 @@ async def send_feishu_dm(*, user_open_id: str, content: str, workspace: str | Pa
     """Send a proactive Feishu direct message to a user open_id."""
     await asyncio.to_thread(_send_feishu_text_sync, user_open_id=user_open_id, content=content, workspace=workspace)
     logger.info("Sent proactive Feishu DM to open_id=%s", user_open_id)
+
+
+async def send_feishu_chat(*, chat_id: str, content: str, workspace: str | Path | None = None) -> None:
+    """Send a proactive Feishu group/chat message to a chat_id."""
+    await asyncio.to_thread(_send_feishu_text_sync, chat_id=chat_id, content=content, workspace=workspace)
+    logger.info("Sent proactive Feishu chat message to chat_id=%s", chat_id)

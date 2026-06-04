@@ -35,8 +35,9 @@ class CronCreateToolInput(BaseModel):
     notify: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Optional notification target. Example: "
-            "{'type': 'feishu_dm', 'user_open_id': 'ou_xxx'} to send job output to a Feishu private chat."
+            "Optional notification target. Examples: "
+            "{'type': 'feishu_dm', 'user_open_id': 'ou_xxx'} for a Feishu private chat, "
+            "or {'type': 'feishu_chat', 'chat_id': 'oc_xxx'} for a Feishu group/chat."
         ),
     )
 

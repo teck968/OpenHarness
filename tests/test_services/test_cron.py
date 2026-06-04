@@ -19,6 +19,7 @@ from openharness.services.cron import (
     validate_cron_expression,
     validate_timezone,
 )
+from openharness.services.cron_scheduler import _notify_job_result
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +76,13 @@ class TestCRUD:
 
     def test_upsert_preserves_notify_target(self) -> None:
         notify = {"type": "feishu_dm", "user_open_id": "ou_test"}
+        upsert_cron_job({"name": "test-job", "schedule": "*/5 * * * *", "command": "echo hi", "notify": notify})
+        job = get_cron_job("test-job")
+        assert job is not None
+        assert job["notify"] == notify
+
+    def test_upsert_preserves_feishu_chat_notify_target(self) -> None:
+        notify = {"type": "feishu_chat", "chat_id": "oc_test"}
         upsert_cron_job({"name": "test-job", "schedule": "*/5 * * * *", "command": "echo hi", "notify": notify})
         job = get_cron_job("test-job")
         assert job is not None
@@ -177,3 +185,56 @@ class TestCorruptData:
             lambda: bad_file,
         )
         assert load_cron_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_notify_job_result_sends_feishu_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[dict[str, str | None]] = []
+
+    async def _fake_send_feishu_chat(*, chat_id: str, content: str, workspace: str | None = None) -> None:
+        sent.append({"chat_id": chat_id, "content": content, "workspace": workspace})
+
+    monkeypatch.setattr("ohmo.gateway.notify.send_feishu_chat", _fake_send_feishu_chat)
+
+    entry = {
+        "status": "success",
+        "returncode": 0,
+        "started_at": "2026-06-04T00:00:00Z",
+        "ended_at": "2026-06-04T00:00:01Z",
+        "stdout": "CRON_OK",
+    }
+    await _notify_job_result(
+        {
+            "name": "nightly",
+            "notify": {
+                "type": "feishu_chat",
+                "chat_id": "oc_test",
+                "workspace": "/repo",
+            },
+        },
+        entry,
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == "oc_test"
+    assert sent[0]["workspace"] == "/repo"
+    assert "Cron job finished: nightly" in str(sent[0]["content"])
+    assert "Status: success (rc=0)" in str(sent[0]["content"])
+    assert "CRON_OK" in str(sent[0]["content"])
+    assert entry["notification_status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_notify_job_result_feishu_chat_requires_chat_id() -> None:
+    entry = {"status": "success", "returncode": 0}
+
+    await _notify_job_result(
+        {
+            "name": "nightly",
+            "notify": {"type": "feishu_chat"},
+        },
+        entry,
+    )
+
+    assert entry["notification_status"] == "failed"
+    assert entry["notification_error"] == "missing notify.chat_id"
