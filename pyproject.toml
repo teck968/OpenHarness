@@ -36,6 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
 dev = [
     "pexpect>=4.9.0",
     "pytest>=8.0.0",

@@ -113,6 +113,14 @@ class SandboxSettings(BaseModel):
     docker: DockerSandboxSettings = Field(default_factory=DockerSandboxSettings)
 
 
+class PostgresSettings(BaseModel):
+    """Postgres session-storage configuration."""
+
+    enabled: bool = False
+    dsn: str = ""
+    ca_bundle: str | None = None
+
+
 class WebSettings(BaseModel):
     """Outbound web tool configuration."""
 
@@ -586,6 +594,7 @@ class Settings(BaseModel):
     hooks: dict[str, list[HookDefinition]] = Field(default_factory=dict)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+    postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     enabled_plugins: dict[str, bool] = Field(default_factory=dict)
     allow_project_plugins: bool = False
