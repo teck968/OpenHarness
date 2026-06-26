@@ -357,15 +357,6 @@ class PostgresSessionBackend:
                 )
 
             # 2. Insert only new messages (those after prev_count)
-            # If the message count shrank, compaction replaced old messages
-            # with summaries — purge and re-insert everything.
-            if new_count <= prev_count:
-                cur.execute(
-                    "DELETE FROM oh_messages WHERE session_id = %s",
-                    (sid,),
-                )
-                prev_count = 0
-
             new_messages = messages[prev_count:]
             for i, message in enumerate(new_messages):
                 turn_index = prev_count + i
