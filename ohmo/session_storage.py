@@ -200,3 +200,24 @@ class OhmoSessionBackend(SessionBackend):
         messages: list[ConversationMessage],
     ) -> Path:
         return export_session_markdown(cwd=cwd, workspace=self._workspace, messages=messages)
+
+
+def create_session_backend(workspace = None):
+    """Create the appropriate session backend for the current configuration.
+
+    Returns a PostgresSessionBackend if postgres is enabled in settings,
+    otherwise falls back to the default OhmoSessionBackend.
+    """
+    from openharness.config.settings import load_settings
+
+    settings = load_settings()
+    if settings.postgres.enabled and settings.postgres.dsn:
+        try:
+            from openharness.services.pg_session import PostgresSessionBackend
+            return PostgresSessionBackend(
+                settings.postgres.dsn,
+                ca_bundle=settings.postgres.ca_bundle,
+            )
+        except ImportError:
+            pass
+    return OhmoSessionBackend(workspace)

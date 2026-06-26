@@ -22,7 +22,7 @@ from ohmo.gateway.service import (
 )
 from ohmo.memory import add_memory_entry, list_memory_files, remove_memory_entry
 from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
-from ohmo.session_storage import OhmoSessionBackend
+from ohmo.session_storage import create_session_backend
 from ohmo.workspace import (
     get_gateway_config_path,
     get_logs_dir,
@@ -463,7 +463,7 @@ def main(
 
     cwd_path = str(Path(cwd).resolve())
     workspace_root = initialize_workspace(workspace)
-    backend = OhmoSessionBackend(workspace_root)
+    backend = create_session_backend(workspace_root)
     restore_messages = None
     restore_tool_metadata = None
     if continue_session:

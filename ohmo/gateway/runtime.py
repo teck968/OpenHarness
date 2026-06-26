@@ -39,7 +39,7 @@ from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
-from ohmo.session_storage import OhmoSessionBackend
+from ohmo.session_storage import create_session_backend
 from ohmo.workspace import get_memory_dir, get_plugins_dir, get_sessions_dir, get_skills_dir, initialize_workspace
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ class OhmoSessionRuntimePool:
         self._publish_group_welcome = publish_group_welcome
         self._workspace = initialize_workspace(workspace)
         self._gateway_config = load_gateway_config(self._workspace)
-        self._session_backend = OhmoSessionBackend(self._workspace)
+        self._session_backend = create_session_backend(self._workspace)
         self._bundles: dict[str, RuntimeBundle] = {}
 
     @property
