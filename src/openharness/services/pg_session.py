@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -54,7 +54,8 @@ _SQL_CREATE_TABLES = [
         created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
         ended_at      TIMESTAMPTZ,
         message_count INTEGER NOT NULL DEFAULT 0,
-        total_tokens  BIGINT NOT NULL DEFAULT 0
+        total_tokens  BIGINT NOT NULL DEFAULT 0,
+        current_epoch INTEGER NOT NULL DEFAULT 0
     )
     """,
     # ── messages ────────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ _SQL_CREATE_TABLES = [
                         ON DELETE CASCADE,
         turn_index  INTEGER NOT NULL,
         role        TEXT NOT NULL,
+        epoch       INTEGER NOT NULL DEFAULT 0,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
@@ -224,6 +226,22 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
                 "ON oh_sessions(session_key) WHERE session_key IS NOT NULL"
             )
 
+        # v2 → v3: add epoch columns for compaction/clear support
+        if current < 3:
+            cur.execute(
+                "ALTER TABLE oh_sessions ADD COLUMN IF NOT EXISTS current_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+            cur.execute(
+                "ALTER TABLE oh_messages ADD COLUMN IF NOT EXISTS epoch INTEGER NOT NULL DEFAULT 0"
+            )
+            cur.execute(
+                "DROP INDEX IF EXISTS idx_messages_session"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                "ON oh_messages(session_id, epoch, turn_index)"
+            )
+
         if current == 0:
             cur.execute(
                 "INSERT INTO oh_meta (key, value) VALUES ('schema_version', %s)",
@@ -300,7 +318,13 @@ class PostgresSessionBackend:
         session_key: str | None = None,
         tool_metadata: dict[str, object] | None = None,
     ) -> Path:
-        """Persist a session snapshot to Postgres."""
+        """Persist a session snapshot to Postgres.
+
+        Detects epoch boundaries: when the message list shrinks (compaction
+        or ``/clear``), a new epoch is started.  Pre‑compaction messages are
+        preserved in the database forever; only the current epoch is returned
+        by ``load_latest`` so the LLM context window stays tight.
+        """
         conn = self._ensure_connection()
         messages = sanitize_conversation_messages(messages)
         sid = session_id or uuid4().hex[:12]
@@ -309,22 +333,28 @@ class PostgresSessionBackend:
         cwd_str = str(Path(cwd).resolve())
 
         with conn.cursor() as cur:
-            # 1. Upsert session row (track the previous message count)
+            # 1. Read existing session state
             cur.execute(
-                "SELECT message_count FROM oh_sessions WHERE session_id = %s",
+                "SELECT message_count, current_epoch FROM oh_sessions WHERE session_id = %s",
                 (sid,),
             )
             existing = cur.fetchone()
             prev_count = existing[0] if existing else 0
-
+            current_epoch = existing[1] if existing else 0
             total_tokens = usage.total_tokens
 
+            # 2. Detect epoch boundary (compaction or /clear shrank the list)
+            if existing and prev_count > 0 and new_count <= prev_count:
+                current_epoch += 1
+                prev_count = 0  # re-insert all messages in new epoch
+
+            # 3. Upsert session row
             if existing:
                 cur.execute(
                     """UPDATE oh_sessions
                        SET session_key = %s, cwd = %s, project_name = %s,
                            model = %s, system_prompt = %s,
-                           message_count = %s,
+                           message_count = %s, current_epoch = %s,
                            total_tokens = oh_sessions.total_tokens + %s
                        WHERE session_id = %s""",
                     (
@@ -334,6 +364,7 @@ class PostgresSessionBackend:
                         model,
                         system_prompt,
                         new_count,
+                        current_epoch,
                         total_tokens,
                         sid,
                     ),
@@ -342,8 +373,9 @@ class PostgresSessionBackend:
                 cur.execute(
                     """INSERT INTO oh_sessions
                            (session_id, session_key, cwd, project_name,
-                            model, system_prompt, message_count, total_tokens)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                            model, system_prompt, message_count, total_tokens,
+                            current_epoch)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
                         sid,
                         session_key,
@@ -353,22 +385,23 @@ class PostgresSessionBackend:
                         system_prompt,
                         new_count,
                         total_tokens,
+                        current_epoch,
                     ),
                 )
 
-            # 2. Insert only new messages (those after prev_count)
+            # 4. Insert messages at the current epoch
             new_messages = messages[prev_count:]
             for i, message in enumerate(new_messages):
                 turn_index = prev_count + i
                 cur.execute(
-                    """INSERT INTO oh_messages (session_id, turn_index, role)
-                       VALUES (%s, %s, %s)
+                    """INSERT INTO oh_messages (session_id, turn_index, role, epoch)
+                       VALUES (%s, %s, %s, %s)
                        RETURNING message_id""",
-                    (sid, turn_index, message.role),
+                    (sid, turn_index, message.role, current_epoch),
                 )
                 message_id = cur.fetchone()[0]
 
-                # 3. Insert content blocks for this message
+                # Insert content blocks for this message
                 for bi, block in enumerate(message.content):
                     row = _block_to_row(block, bi)
                     row["message_id"] = message_id
@@ -385,7 +418,7 @@ class PostgresSessionBackend:
                         row,
                     )
 
-            # 4. Record usage snapshot
+            # 5. Record usage snapshot
             cur.execute(
                 """INSERT INTO oh_usage_snapshots
                        (session_id, turn_index, input_tokens, output_tokens,
@@ -494,16 +527,22 @@ class PostgresSessionBackend:
     # ── internal helpers ────────────────────────────────────────────────────
 
     def _build_snapshot_dict(self, cur, session: dict[str, Any]) -> dict[str, Any]:
-        """Reconstruct the snapshot payload dict from normalized tables."""
-        sid = session["session_id"]
+        """Reconstruct the snapshot payload dict from normalized tables.
 
-        # Load messages
+        Only messages from the session's ``current_epoch`` are returned so
+        the runtime LLM context window stays tight.  Pre‑compaction epochs
+        remain in the database for dreaming / knowledge extraction.
+        """
+        sid = session["session_id"]
+        current_epoch = session.get("current_epoch", 0)
+
+        # Load messages for the current epoch only
         cur.execute(
             """SELECT message_id, turn_index, role
                FROM oh_messages
-               WHERE session_id = %s
+               WHERE session_id = %s AND epoch = %s
                ORDER BY turn_index""",
-            (sid,),
+            (sid, current_epoch),
         )
         message_rows = cur.fetchall()
 
