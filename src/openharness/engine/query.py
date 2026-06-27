@@ -697,6 +697,7 @@ async def run_query(
         return
 
     turn_count = 0
+    empty_message_attempts = 0
     while context.max_turns is None or turn_count < context.max_turns:
         turn_count += 1
         if effective_max_tokens != context.max_tokens and not reported_token_clamp:
@@ -790,7 +791,21 @@ async def run_query(
                 coordinator_context_message = messages.pop()
 
         if final_message.role == "assistant" and final_message.is_effectively_empty():
-            log.warning("dropping empty assistant message from provider response")
+            if empty_message_attempts < 2:
+                empty_message_attempts += 1
+                turn_count = max(0, turn_count - 1)
+                log.warning(
+                    "dropping empty assistant message from provider response (attempt %d); retrying",
+                    empty_message_attempts,
+                )
+                yield StatusEvent(
+                    message=(
+                        "Model returned an empty response; retrying "
+                        f"(attempt {empty_message_attempts} of 2)."
+                    )
+                ), None
+                continue
+            log.warning("dropping empty assistant message from provider response (final)")
             yield ErrorEvent(
                 message=(
                     "Model returned an empty assistant message. "
