@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -55,7 +55,8 @@ _SQL_CREATE_TABLES = [
         ended_at      TIMESTAMPTZ,
         message_count INTEGER NOT NULL DEFAULT 0,
         total_tokens  BIGINT NOT NULL DEFAULT 0,
-        current_epoch INTEGER NOT NULL DEFAULT 0
+        current_epoch INTEGER NOT NULL DEFAULT 0,
+        dream_run_id  BIGINT
     )
     """,
     # ── messages ────────────────────────────────────────────────────────────
@@ -108,6 +109,18 @@ _SQL_CREATE_TABLES = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_usage_session ON oh_usage_snapshots(session_id)",
+    # ── dream_runs ────────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS oh_dream_runs (
+        run_id              BIGSERIAL PRIMARY KEY,
+        started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at         TIMESTAMPTZ,
+        status              TEXT NOT NULL DEFAULT 'running',
+        sessions_processed  INTEGER NOT NULL DEFAULT 0,
+        knowledge_extracted INTEGER NOT NULL DEFAULT 0,
+        error_message       TEXT
+    )
+    """,
 ]
 
 _DB_MODULE_AVAILABLE = True
@@ -242,6 +255,17 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
                 "ON oh_messages(session_id, epoch, turn_index)"
             )
 
+        # v3 → v4: add dream tracking — oh_dream_runs table + dream_run_id FK
+        if current < 4:
+            cur.execute(_SQL_CREATE_TABLES[-1])  # oh_dream_runs
+            cur.execute(
+                "ALTER TABLE oh_sessions ADD COLUMN IF NOT EXISTS dream_run_id BIGINT"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_dream_run "
+                "ON oh_sessions(dream_run_id) WHERE dream_run_id IS NOT NULL"
+            )
+
         if current == 0:
             cur.execute(
                 "INSERT INTO oh_meta (key, value) VALUES ('schema_version', %s)",
@@ -316,6 +340,7 @@ class PostgresSessionBackend:
         usage: UsageSnapshot,
         session_id: str | None = None,
         session_key: str | None = None,
+        dream_run_id: int | None = None,
         tool_metadata: dict[str, object] | None = None,
     ) -> Path:
         """Persist a session snapshot to Postgres.
@@ -355,7 +380,8 @@ class PostgresSessionBackend:
                        SET session_key = %s, cwd = %s, project_name = %s,
                            model = %s, system_prompt = %s,
                            message_count = %s, current_epoch = %s,
-                           total_tokens = oh_sessions.total_tokens + %s
+                           total_tokens = oh_sessions.total_tokens + %s,
+                           dream_run_id = COALESCE(oh_sessions.dream_run_id, %s)
                        WHERE session_id = %s""",
                     (
                         session_key,
@@ -366,6 +392,7 @@ class PostgresSessionBackend:
                         new_count,
                         current_epoch,
                         total_tokens,
+                        dream_run_id,
                         sid,
                     ),
                 )
@@ -374,8 +401,8 @@ class PostgresSessionBackend:
                     """INSERT INTO oh_sessions
                            (session_id, session_key, cwd, project_name,
                             model, system_prompt, message_count, total_tokens,
-                            current_epoch)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                            current_epoch, dream_run_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
                         sid,
                         session_key,
@@ -386,6 +413,7 @@ class PostgresSessionBackend:
                         new_count,
                         total_tokens,
                         current_epoch,
+                        dream_run_id,
                     ),
                 )
 
