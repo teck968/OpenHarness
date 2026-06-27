@@ -115,6 +115,43 @@ def _get_retry_delay(attempt: int, exc: Exception | None = None) -> float:
     return delay + jitter
 
 
+def _log_tool_pair_diagnostic(api_messages: list[dict[str, Any]]) -> None:
+    """Validate tool_use/tool_result pairing before sending to the provider.
+
+    Logs orphaned tool_use blocks at INFO so the detail lands in gateway.log
+    even when the log level is the default INFO.
+    """
+    tool_use_ids: list[tuple[int, str]] = []
+    tool_result_ids: set[str] = set()
+
+    for idx, msg in enumerate(api_messages):
+        for block in msg.get("content", []):
+            if block.get("type") == "tool_use":
+                tool_use_ids.append((idx, block.get("id", "")))
+            elif block.get("type") == "tool_result":
+                tool_result_ids.add(block.get("tool_use_id", ""))
+
+    orphans = [(idx, tid) for idx, tid in tool_use_ids if tid not in tool_result_ids]
+
+    if orphans:
+        orphan_detail = " ".join(f"msg[{idx}]={tid}" for idx, tid in orphans)
+        log.info(
+            "API_TOOL_PAIR_DIAG: ORPHANS_FOUND total_msgs=%d tool_uses=%d tool_results=%d orphans=%d %s",
+            len(api_messages),
+            len(tool_use_ids),
+            len(tool_result_ids),
+            len(orphans),
+            orphan_detail,
+        )
+    else:
+        log.info(
+            "API_TOOL_PAIR_DIAG: CLEAN total_msgs=%d tool_uses=%d tool_results=%d",
+            len(api_messages),
+            len(tool_use_ids),
+            len(tool_result_ids),
+        )
+
+
 class AnthropicApiClient:
     """Thin wrapper around the Anthropic async SDK with retry logic."""
 
@@ -207,6 +244,9 @@ class AnthropicApiClient:
             "messages": [message.to_api_param() for message in request.messages],
             "max_tokens": request.max_tokens,
         }
+
+        # --- Diagnostic: validate tool_use/tool_result pairing before API call ---
+        _log_tool_pair_diagnostic(params["messages"])
         if request.system_prompt:
             params["system"] = request.system_prompt
         if self._claude_oauth:
