@@ -370,6 +370,7 @@ class OhmoSessionRuntimePool:
             )
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             reply_parts: list[str] = []
+            text_flushed: list[bool] = [False]
             try:
                 async for event in bundle.engine.continue_pending(max_turns=turns):
                     async for update in self._convert_stream_event(
@@ -379,6 +380,7 @@ class OhmoSessionRuntimePool:
                         session_key=session_key,
                         content=user_prompt,
                         reply_parts=reply_parts,
+                        text_flushed=text_flushed,
                     ):
                         yield update
             except MaxTurnsExceeded as exc:
@@ -410,6 +412,7 @@ class OhmoSessionRuntimePool:
     ):
         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
         reply_parts: list[str] = []
+        text_flushed: list[bool] = [False]
         emitted_media: set[str] = set()
         yield GatewayStreamUpdate(
             kind="progress",
@@ -455,6 +458,7 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             content=user_prompt,
                             reply_parts=reply_parts,
+                            text_flushed=text_flushed,
                         ):
                             _remember_update_media(emitted_media, update)
                             yield update
@@ -466,6 +470,7 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     content=user_prompt,
                     reply_parts=reply_parts,
+                    text_flushed=text_flushed,
                 ):
                     _remember_update_media(emitted_media, update)
                     yield update
@@ -511,6 +516,7 @@ class OhmoSessionRuntimePool:
         session_key: str,
         content: str,
         reply_parts: list[str],
+        text_flushed: list[bool],
     ):
         if isinstance(event, AssistantTextDelta):
             reply_parts.append(event.text)
@@ -561,6 +567,23 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionStarted):
+            # Flush any accumulated text as a progress update before tools fire,
+            # so intent/thinking text reaches the channel before tool hints.
+            if not text_flushed[0]:
+                text_flushed[0] = True
+                flushed = "".join(reply_parts).strip()
+                if flushed:
+                    yield GatewayStreamUpdate(
+                        kind="progress",
+                        text=_format_channel_progress(
+                            channel=message.channel,
+                            kind="status",
+                            text=flushed,
+                            session_key=session_key,
+                            content=content,
+                        ),
+                        metadata={"_progress": True, "_session_key": session_key},
+                    )
             summary = _summarize_tool_input(event.tool_name, event.tool_input)
             logger.info(
                 "ohmo runtime tool start session_key=%s session_id=%s tool=%s summary=%r",
