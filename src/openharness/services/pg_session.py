@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -121,6 +121,38 @@ _SQL_CREATE_TABLES = [
         error_message       TEXT
     )
     """,
+    # ── dreamed_messages ──────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS oh_dreamed_messages (
+        session_id      TEXT NOT NULL REFERENCES oh_sessions(session_id)
+                            ON DELETE CASCADE,
+        last_message_id BIGINT NOT NULL,
+        dreamed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (session_id)
+    )
+    """,
+    # ── knowledge ─────────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS oh_knowledge (
+        id                BIGSERIAL PRIMARY KEY,
+        knowledge_type    TEXT NOT NULL,
+        title             TEXT NOT NULL,
+        content           TEXT NOT NULL,
+        tags              TEXT[] DEFAULT '{}',
+        confidence        REAL NOT NULL DEFAULT 1.0,
+        source            TEXT,
+        source_session_id TEXT,
+        embedding         VECTOR(1536),
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_recalled_at  TIMESTAMPTZ,
+        recall_count      INTEGER NOT NULL DEFAULT 0,
+        content_hash      TEXT NOT NULL,
+        archived          BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_content_hash ON oh_knowledge(content_hash) WHERE NOT archived",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_type ON oh_knowledge(knowledge_type) WHERE NOT archived",
 ]
 
 _DB_MODULE_AVAILABLE = True
@@ -257,13 +289,62 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
 
         # v3 → v4: add dream tracking — oh_dream_runs table + dream_run_id FK
         if current < 4:
-            cur.execute(_SQL_CREATE_TABLES[-1])  # oh_dream_runs
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS oh_dream_runs (
+                    run_id              BIGSERIAL PRIMARY KEY,
+                    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    finished_at         TIMESTAMPTZ,
+                    status              TEXT NOT NULL DEFAULT 'running',
+                    sessions_processed  INTEGER NOT NULL DEFAULT 0,
+                    knowledge_extracted INTEGER NOT NULL DEFAULT 0,
+                    error_message       TEXT
+                )
+            """)
             cur.execute(
                 "ALTER TABLE oh_sessions ADD COLUMN IF NOT EXISTS dream_run_id BIGINT"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sessions_dream_run "
                 "ON oh_sessions(dream_run_id) WHERE dream_run_id IS NOT NULL"
+            )
+
+        # v4 → v5: add dreamed_messages and knowledge tables
+        if current < 5:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS oh_dreamed_messages (
+                    session_id      TEXT NOT NULL REFERENCES oh_sessions(session_id)
+                                        ON DELETE CASCADE,
+                    last_message_id BIGINT NOT NULL,
+                    dreamed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (session_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS oh_knowledge (
+                    id                BIGSERIAL PRIMARY KEY,
+                    knowledge_type    TEXT NOT NULL,
+                    title             TEXT NOT NULL,
+                    content           TEXT NOT NULL,
+                    tags              TEXT[] DEFAULT '{}',
+                    confidence        REAL NOT NULL DEFAULT 1.0,
+                    source            TEXT,
+                    source_session_id TEXT,
+                    embedding         VECTOR(1536),
+                    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_recalled_at  TIMESTAMPTZ,
+                    recall_count      INTEGER NOT NULL DEFAULT 0,
+                    content_hash      TEXT NOT NULL,
+                    archived          BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_content_hash "
+                "ON oh_knowledge(content_hash) WHERE NOT archived"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_type "
+                "ON oh_knowledge(knowledge_type) WHERE NOT archived"
             )
 
         if current == 0:
