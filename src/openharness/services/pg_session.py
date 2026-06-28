@@ -521,8 +521,16 @@ class PostgresSessionBackend:
         executor = self._dreaming_executor
         conn = self._conn
 
-        # Get last dreamed count
+        # Get total message count from DB (not context window size, which
+        # shrinks on compaction — we need the cumulative count across all epochs)
         cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s",
+            (session_id,),
+        )
+        total_count = cur.fetchone()[0]
+
+        # Get last dreamed count
         cur.execute(
             "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
             (session_id,),
@@ -530,7 +538,6 @@ class PostgresSessionBackend:
         row = cur.fetchone()
         last_dreamed = 0
         if row is not None:
-            # Map message_id back to count — approximate via epoch/turn
             cur.execute(
                 "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
                 (session_id, row[0]),
@@ -539,7 +546,7 @@ class PostgresSessionBackend:
             if count_row:
                 last_dreamed = count_row[0]
 
-        if not executor.should_dream(message_count, last_dreamed):
+        if not executor.should_dream(total_count, last_dreamed):
             return
 
         # Guard against concurrent dream runs for this session
@@ -556,7 +563,7 @@ class PostgresSessionBackend:
 
         log.info(
             "Dream milestone triggered: session=%s count=%d last_dreamed=%d",
-            session_id, message_count, last_dreamed,
+            session_id, total_count, last_dreamed,
         )
 
         loop = self._dreaming_event_loop
