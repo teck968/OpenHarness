@@ -491,6 +491,9 @@ async def close_runtime(bundle: RuntimeBundle) -> None:
     except Exception:
         pass  # personalization is best-effort, never block session end
 
+    # Session‑end dreaming (Stage 2)
+    _trigger_session_end_dream(bundle)
+
     await bundle.mcp_manager.close()
     await bundle.hook_executor.execute(
         HookEvent.SESSION_END,
@@ -506,6 +509,31 @@ def _last_user_text(messages: list[ConversationMessage]) -> str:
         if msg.role == "user" and msg.text.strip():
             return msg.text.strip()
     return ""
+
+
+def _trigger_session_end_dream(bundle: "RuntimeBundle") -> None:
+    """Trigger session‑end dreaming if the session backend supports it."""
+    try:
+        from openharness.services.pg_session import PostgresSessionBackend
+    except ImportError:
+        return
+    if not isinstance(bundle.session_backend, PostgresSessionBackend):
+        return
+    # Count messages from the engine state
+    msg_count = len(bundle.engine.messages)
+    # Get project_name from the PG session row
+    backend = bundle.session_backend
+    conn = backend._ensure_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT project_name FROM oh_sessions WHERE session_id = %s",
+        (bundle.session_id,),
+    )
+    row = cur.fetchone()
+    project_name = row[0] if row else "unknown"
+    backend.end_session(
+        bundle.session_id, msg_count, str(bundle.cwd), project_name,
+    )
 
 
 def _truncate(text: str, limit: int) -> str:

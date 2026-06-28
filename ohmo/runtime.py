@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.engine.stream_events import AssistantTextDelta, AssistantTurnComplete, CompactProgressEvent, ErrorEvent, StatusEvent
@@ -42,6 +46,8 @@ async def run_ohmo_backend(
     cwd_path = str(Path(cwd or Path.cwd()).resolve())
     workspace_root = initialize_workspace(workspace)
     extra_skill_dirs, extra_plugin_roots = _ohmo_extra_roots(workspace_root)
+    session_backend = create_session_backend(workspace_root)
+    _wire_dreaming(session_backend, workspace_root)
     return await run_backend_host(
         cwd=cwd_path,
         model=model,
@@ -52,7 +58,7 @@ async def run_ohmo_backend(
         restore_messages=restore_messages,
         restore_tool_metadata=restore_tool_metadata,
         enforce_max_turns=max_turns is not None,
-        session_backend=create_session_backend(workspace_root),
+        session_backend=session_backend,
         extra_skill_dirs=extra_skill_dirs,
         extra_plugin_roots=extra_plugin_roots,
         memory_backend=create_memory_command_backend(workspace_root),
@@ -64,6 +70,31 @@ async def run_ohmo_backend(
             "runner_module": "ohmo",
         },
     )
+
+
+def _wire_dreaming(session_backend: Any, workspace_root: Path) -> None:
+    """If *session_backend* is a PostgresSessionBackend, wire up the dreaming executor."""
+    try:
+        from openharness.services.pg_session import PostgresSessionBackend
+    except ImportError:
+        return
+    if not isinstance(session_backend, PostgresSessionBackend):
+        return
+
+    from openharness.services.dreaming import DreamingExecutor
+
+    conn = session_backend._ensure_connection()
+    dream_workspace = Path(workspace_root) / "dream-workspace"
+    dream_workspace.mkdir(parents=True, exist_ok=True)
+    executor = DreamingExecutor(conn, workspace=dream_workspace)
+
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        session_backend.set_dreaming(executor, loop=loop)
+        log.info("Dreaming executor wired for %s", workspace_root)
+    except RuntimeError:
+        log.warning("No event loop available — dreaming deferred")
 
 
 def build_ohmo_backend_command(

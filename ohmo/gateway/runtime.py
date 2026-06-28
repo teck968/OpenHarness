@@ -149,6 +149,29 @@ class OhmoSessionRuntimePool:
             self._provider_profile = self._gateway_config.provider_profile
         return result
 
+    def _wire_dreaming_if_pg_backend(self) -> None:
+        """Wire milestone-triggered dreaming if session backend is PG."""
+        try:
+            from openharness.services.pg_session import PostgresSessionBackend
+        except ImportError:
+            return
+        if not isinstance(self._session_backend, PostgresSessionBackend):
+            return
+        if getattr(self._session_backend, "_dreaming_executor", None) is not None:
+            return  # already wired
+        from openharness.services.dreaming import DreamingExecutor
+        conn = self._session_backend._ensure_connection()
+        dream_workspace = Path(self._workspace) / "dream-workspace"
+        dream_workspace.mkdir(parents=True, exist_ok=True)
+        executor = DreamingExecutor(conn, workspace=dream_workspace)
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            self._session_backend.set_dreaming(executor, loop=loop)
+            logger.info("Gateway dreaming executor wired")
+        except RuntimeError:
+            logger.warning("Gateway dreaming deferred — no event loop")
+
     async def get_bundle(
         self,
         session_key: str,
@@ -211,6 +234,10 @@ class OhmoSessionRuntimePool:
             bundle.session_id = str(snapshot["session_id"])
         self._register_gateway_tools(bundle)
         await start_runtime(bundle)
+
+        # Wire dreaming for milestone triggers
+        self._wire_dreaming_if_pg_backend()
+
         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, latest_user_prompt))
         logger.info(
             "ohmo runtime started session_key=%s session_id=%s restored_messages=%s",
@@ -265,6 +292,7 @@ class OhmoSessionRuntimePool:
         if parsed is not None and not message.media:
             command, args = parsed
             command_name = str(getattr(command, "name", "") or "")
+
             remote_allowed = getattr(command, "remote_invocable", True)
             if not remote_allowed and self._remote_admin_allowed(command):
                 remote_allowed = True
