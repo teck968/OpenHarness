@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # Doubling milestones: 10, 20, 40, 80, then every 100 thereafter
 _MILESTONES = {10, 20, 40, 80}
 _CAP_INTERVAL = 100
-_CHILD_TASK_TIMEOUT = 120  # seconds
+_CHILD_TASK_TIMEOUT = 180  # seconds — DeepSeek can be slow on large prompts
 
 
 # ── public api ─────────────────────────────────────────────────────────────
@@ -242,8 +242,6 @@ class DreamingExecutor:
             str(self._workspace),
             "--cwd",
             str(Path(cwd).resolve()),
-            "--disallowed-tools",
-            "edit_file,write_file,bash,notebook_edit",
         ]
 
         log.info("Dream child spawn: cwd=%s workspace=%s", cwd, self._workspace)
@@ -252,6 +250,7 @@ class DreamingExecutor:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
 
         try:
@@ -272,15 +271,27 @@ class DreamingExecutor:
         self, child_output: str, result: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Parse child output as JSON.  Returns None on failure."""
-        # Strip markdown fences if present
         text = child_output.strip()
-        if text.startswith("```"):
+        # Extract JSON block — model may output analysis text before/after
+        # Look for ```json ... ``` fences first
+        if "```json" in text:
+            start = text.index("```json") + 7
+            end = text.index("```", start)
+            text = text[start:end].strip()
+        elif text.startswith("```"):
             lines = text.split("\n")
             if lines[0].startswith("```"):
                 lines = lines[1:]
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
+        # If still no JSON, try to find the outermost braces
+        if not text.startswith("{"):
+            brace_start = text.find("{")
+            if brace_start >= 0:
+                brace_end = text.rfind("}") + 1
+                if brace_end > brace_start:
+                    text = text[brace_start:brace_end]
 
         try:
             data = json.loads(text)

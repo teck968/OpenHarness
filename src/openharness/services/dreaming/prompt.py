@@ -71,7 +71,14 @@ evidence raises confidence, use "update" with the new confidence instead.
 Cross‑session reinforcement is deferred to a future stage.  For now, only
 same‑session prior extractions are provided below.
 
-Return: {"extractions": [...], "summary": "1-2 sentence summary of this dream run"}"""
+**OUTPUT FORMAT:**
+After your analysis, output exactly ONE JSON object.  Do not wrap it in
+explanations — your entire response after analysis must be valid JSON.
+Use ```json fences:
+
+```json
+{"extractions": [...], "summary": "1-2 sentence summary of this dream run"}
+```"""
 
 _SELF_CORRECTION_TEMPLATE = """
 PRIOR EXTRACTIONS FROM THIS SESSION

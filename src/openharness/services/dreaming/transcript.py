@@ -148,7 +148,7 @@ def _compact_block(block: dict[str, Any], role: str) -> str | None:
             out = result[:TOOL_RESULT_MAX]
             if len(result) > TOOL_RESULT_MAX:
                 out += " " + TRUNCATION_MARKER
-            return f"→ {out.strip()}"
+            return f"> {out.strip()}"
         return None
 
     if bt == "image":
@@ -170,7 +170,7 @@ def _full_block(block: dict[str, Any], role: str) -> str | None:
         inp = _compact_json(tool_input) if tool_input else ""
         return f"tool: {tool_name}({inp})"
     if bt == "tool_result":
-        return f"→ {result.strip()}" if result else None
+        return f"> {result.strip()}" if result else None
     if bt == "image":
         return None
     return None
