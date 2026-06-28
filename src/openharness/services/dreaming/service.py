@@ -249,6 +249,8 @@ class DreamingExecutor:
             str(self._workspace),
             "--cwd",
             str(Path(cwd).resolve()),
+            "--denied-tools",
+            "bash,write_file,edit_file,notebook_edit",
         ]
 
         log.info("Dream child spawn: cwd=%s workspace=%s", cwd, self._workspace)

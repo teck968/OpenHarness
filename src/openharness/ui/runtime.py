@@ -297,6 +297,7 @@ async def build_runtime(
     memory_backend: MemoryCommandBackend | None = None,
     include_project_memory: bool = True,
     autodream_context: dict[str, object] | None = None,
+    denied_tools: list[str] | None = None,
 ) -> RuntimeBundle:
     """Build the shared runtime for an OpenHarness session."""
     settings_overrides: dict[str, Any] = {
@@ -311,6 +312,14 @@ async def build_runtime(
         "permission_mode": permission_mode,
     }
     settings = load_settings().merge_cli_overrides(**settings_overrides)
+    if denied_tools is not None:
+        settings = settings.model_copy(
+            update={
+                "permission": settings.permission.model_copy(
+                    update={"denied_tools": list(denied_tools)}
+                )
+            }
+        )
     cwd = str(Path(cwd).expanduser().resolve()) if cwd else str(Path.cwd())
     normalized_skill_dirs = tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
     normalized_plugin_roots = tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))

@@ -449,6 +449,7 @@ def main(
     ctx: typer.Context,
     print_mode: str | None = typer.Option(None, "--print", "-p", help="Run a single prompt and exit"),
     print_file: str | None = typer.Option(None, "--print-file", help="Read prompt from a file and exit"),
+    denied_tools: str | None = typer.Option(None, "--denied-tools", help="Comma-separated tools to deny (for --print / --print-file)"),
     model: str | None = typer.Option(None, "--model", help="Model override for this session"),
     profile: str | None = typer.Option(None, "--profile", help="Provider profile to use"),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
@@ -501,6 +502,7 @@ def main(
         prompt_text = print_mode or ""
         if print_file:
             prompt_text = Path(print_file).read_text(encoding="utf-8")
+        denied_list = [t.strip() for t in denied_tools.split(",") if t.strip()] if denied_tools else None
         raise SystemExit(
             asyncio.run(
                 run_ohmo_print_mode(
@@ -510,6 +512,7 @@ def main(
                     model=model,
                     max_turns=max_turns,
                     provider_profile=profile,
+                    denied_tools=denied_list,
                 )
             )
         )

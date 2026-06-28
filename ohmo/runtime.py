@@ -127,6 +127,7 @@ async def launch_ohmo_react_tui(
     model: str | None = None,
     max_turns: int | None = None,
     provider_profile: str | None = None,
+    denied_tools: list[str] | None = None,
 ) -> int:
     """Launch the shared React terminal UI with an ohmo backend."""
     frontend_dir = get_frontend_dir()
@@ -183,6 +184,7 @@ async def run_ohmo_print_mode(
     model: str | None = None,
     max_turns: int | None = None,
     provider_profile: str | None = None,
+    denied_tools: list[str] | None = None,
 ) -> int:
     """Run a single ohmo prompt and print the assistant output."""
     cwd_path = str(Path(cwd or Path.cwd()).resolve())
@@ -208,6 +210,7 @@ async def run_ohmo_print_mode(
                 "app_label": "ohmo personal memory",
                 "runner_module": "ohmo",
             },
+            denied_tools=denied_tools,
         )
         await start_runtime(bundle)
 
