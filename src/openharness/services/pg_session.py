@@ -7,6 +7,7 @@ Protocol.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -15,6 +16,8 @@ from typing import Any
 from uuid import uuid4
 
 from openharness.api.usage import UsageSnapshot
+
+log = logging.getLogger(__name__)
 from openharness.engine.messages import (
     ConversationMessage,
     ImageBlock,
@@ -32,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -142,6 +145,8 @@ _SQL_CREATE_TABLES = [
         confidence        REAL NOT NULL DEFAULT 1.0,
         source            TEXT,
         source_session_id TEXT,
+        source_evidences  JSONB NOT NULL DEFAULT '[]'::jsonb,
+        scope             TEXT NOT NULL DEFAULT 'global',
         embedding         VECTOR(1536),
         created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -347,6 +352,33 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
                 "ON oh_knowledge(knowledge_type) WHERE NOT archived"
             )
 
+        # v5 → v6: add source_evidences JSONB and scope columns.
+        # Backfill existing rows: single‑entry evidence array from
+        # source_session_id; scope defaults to 'global' until dreamer sets it.
+        if current < 6:
+            cur.execute(
+                "ALTER TABLE oh_knowledge ADD COLUMN IF NOT EXISTS "
+                "source_evidences JSONB NOT NULL DEFAULT '[]'::jsonb"
+            )
+            cur.execute(
+                "ALTER TABLE oh_knowledge ADD COLUMN IF NOT EXISTS "
+                "scope TEXT NOT NULL DEFAULT 'global'"
+            )
+            cur.execute(
+                """UPDATE oh_knowledge
+                   SET source_evidences =
+                       CASE WHEN source_session_id IS NOT NULL
+                       THEN jsonb_build_array(
+                           jsonb_build_object(
+                               'session_id', source_session_id,
+                               'turns', '[]'::jsonb
+                           )
+                       )
+                       ELSE '[]'::jsonb
+                       END
+                   WHERE source_evidences = '[]'::jsonb"""
+            )
+
         if current == 0:
             cur.execute(
                 "INSERT INTO oh_meta (key, value) VALUES ('schema_version', %s)",
@@ -383,6 +415,21 @@ class PostgresSessionBackend:
         self._dsn = dsn
         self._ca_bundle = ca_bundle
         self._conn: Any = None
+        self._dreaming_executor: Any = None
+        self._dreaming_event_loop: Any = None
+
+    def set_dreaming(self, executor: Any, *, loop: Any = None) -> None:
+        """Register a :class:`~openharness.services.dreaming.DreamingExecutor`
+        for milestone‑triggered dreaming.  *loop* is the event loop used to
+        schedule background dream tasks."""
+        self._dreaming_executor = executor
+        if loop is None:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+        self._dreaming_event_loop = loop
 
     # ── connection management ───────────────────────────────────────────────
 
@@ -404,6 +451,101 @@ class PostgresSessionBackend:
         if self._conn is not None and not self._conn.closed:
             self._conn.close()
             self._conn = None
+
+    def end_session(
+        self, session_id: str, message_count: int, cwd_str: str, project_name: str,
+    ) -> None:
+        """Mark a session as ended and trigger session‑end dreaming if warranted."""
+        if self._conn is None:
+            return
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE oh_sessions SET ended_at = now() WHERE session_id = %s AND ended_at IS NULL",
+            (session_id,),
+        )
+        self._conn.commit()
+
+        # Session‑end dreaming trigger
+        if self._dreaming_executor is not None and self._dreaming_event_loop is not None:
+            executor = self._dreaming_executor
+
+            # Get last dreamed count
+            cur.execute(
+                "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            last_dreamed = 0
+            if row is not None:
+                cur.execute(
+                    "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
+                    (session_id, row[0]),
+                )
+                count_row = cur.fetchone()
+                if count_row:
+                    last_dreamed = count_row[0]
+
+            if executor.should_dream_on_end(message_count, last_dreamed):
+                log.info(
+                    "Dream session-end triggered: session=%s count=%d last_dreamed=%d",
+                    session_id, message_count, last_dreamed,
+                )
+                loop = self._dreaming_event_loop
+                asyncio.ensure_future(
+                    executor.run_for_session(
+                        session_id,
+                        cwd=cwd_str,
+                        project_name=project_name,
+                    ),
+                    loop=loop,
+                )
+
+    def _maybe_trigger_dream(
+        self, session_id: str, message_count: int, prev_count: int,
+        project_name: str, cwd_str: str,
+    ) -> None:
+        """Check milestones and schedule a background dream if triggered."""
+        if not self._dreaming_executor or not self._dreaming_event_loop:
+            return
+
+        executor = self._dreaming_executor
+        conn = self._conn
+
+        # Get last dreamed count
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        last_dreamed = 0
+        if row is not None:
+            # Map message_id back to count — approximate via epoch/turn
+            cur.execute(
+                "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
+                (session_id, row[0]),
+            )
+            count_row = cur.fetchone()
+            if count_row:
+                last_dreamed = count_row[0]
+
+        if not executor.should_dream(message_count, last_dreamed):
+            return
+
+        log.info(
+            "Dream milestone triggered: session=%s count=%d last_dreamed=%d",
+            session_id, message_count, last_dreamed,
+        )
+
+        loop = self._dreaming_event_loop
+        asyncio.ensure_future(
+            executor.run_for_session(
+                session_id,
+                cwd=cwd_str,
+                project_name=project_name,
+            ),
+            loop=loop,
+        )
 
     # ── SessionBackend Protocol ─────────────────────────────────────────────
 
@@ -546,6 +688,13 @@ class PostgresSessionBackend:
             )
 
             conn.commit()
+
+            # ── dreaming trigger ─────────────────────────────────────────
+            if self._dreaming_executor is not None and self._dreaming_event_loop is not None:
+                try:
+                    self._maybe_trigger_dream(sid, new_count, prev_count, project_name, cwd_str)
+                except Exception:
+                    log.exception("Dream trigger check failed for %s", sid)
 
         return Path(str(Path(cwd).resolve())) / ".openharness" / "sessions" / f"session-{sid}.json"
 

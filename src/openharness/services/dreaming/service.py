@@ -1,0 +1,475 @@
+"""Dreaming executor — orchestrates knowledge extraction from session transcripts.
+
+Called from:
+- ``save_snapshot`` (milestone trigger)
+- Session teardown (session‑end trigger)
+- Cron daemon ``/dream --sweep`` command
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from openharness.services.dreaming.transcript import load_compacted_transcript, load_full_transcript
+from openharness.services.dreaming.prompt import build_dream_prompt
+
+log = logging.getLogger(__name__)
+
+# ── milestone constants ───────────────────────────────────────────────────
+
+# Doubling milestones: 10, 20, 40, 80, then every 100 thereafter
+_MILESTONES = {10, 20, 40, 80}
+_CAP_INTERVAL = 100
+_CHILD_TASK_TIMEOUT = 120  # seconds
+
+
+# ── public api ─────────────────────────────────────────────────────────────
+
+class DreamingExecutor:
+    """Orchestrate a dream run for a single session."""
+
+    def __init__(self, conn: Any, *, workspace: Path) -> None:
+        self._conn = conn
+        self._workspace = Path(workspace)
+
+    # ── milestone detection ──────────────────────────────────────────────
+
+    def next_milestone_for(self, message_count: int) -> int | None:
+        """Return the next milestone *message_count* will cross, or None."""
+        if message_count < 10:
+            return None
+        if message_count in _MILESTONES:
+            return message_count
+        if message_count < 80:
+            # find next doubling milestone
+            for m in sorted(_MILESTONES):
+                if message_count > m and message_count <= m * 2:
+                    # check if the count crosses it
+                    prev = m
+                    next_m = m * 2
+                    if next_m in _MILESTONES and message_count >= next_m:
+                        return next_m
+                    # Actually simplify: check if message_count is between milestones
+            return None
+        # capped phase: every 100 after 80
+        base = ((message_count - 80 + _CAP_INTERVAL - 1) // _CAP_INTERVAL) * _CAP_INTERVAL + 80
+        if message_count >= base and (message_count - base) < _CAP_INTERVAL:
+            return base
+        # check if we just crossed
+        last_milestone = 80 + ((message_count - 80) // _CAP_INTERVAL) * _CAP_INTERVAL
+        if message_count >= last_milestone:
+            # this was already triggered or is the current one
+            pass
+        return None
+
+    def should_dream(self, message_count: int, last_dreamed_count: int) -> bool:
+        """Return True if *message_count* has crossed a milestone since
+        *last_dreamed_count*."""
+        if message_count < 10:
+            return False
+        next_m = _next_milestone_after(last_dreamed_count)
+        return next_m is not None and message_count >= next_m
+
+    # ── session‑end trigger ──────────────────────────────────────────────
+
+    def should_dream_on_end(self, message_count: int, last_dreamed_count: int) -> bool:
+        """Return True if the session‑end trigger should fire.
+
+        Triggers when the delta since last dream exceeds half the milestone
+        interval (50 messages in the capped phase).
+        """
+        threshold = min(_CAP_INTERVAL // 2, 50)
+        return (message_count - last_dreamed_count) >= threshold
+
+    # ── main entry point ─────────────────────────────────────────────────
+
+    async def run_for_session(
+        self,
+        session_id: str,
+        *,
+        cwd: str | Path,
+        project_name: str,
+        dream_run_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Execute a full dream run for *session_id*.
+
+        Returns a result dict with keys: ``status``, ``created``, ``updated``,
+        ``deprecated``, ``reinforced``, ``errors``, ``summary``.
+        """
+        result: dict[str, Any] = {
+            "status": "error",
+            "created": 0,
+            "updated": 0,
+            "deprecated": 0,
+            "reinforced": 0,
+            "errors": [],
+            "summary": "",
+        }
+
+        # 1. Create dream_run record
+        if dream_run_id is None:
+            dream_run_id = self._create_dream_run()
+
+        # 2. Load transcript
+        try:
+            compacted = load_compacted_transcript(self._conn, session_id)
+            full_text = load_full_transcript(self._conn, session_id)
+        except Exception as exc:
+            log.error("Failed to load transcript for %s: %s", session_id, exc)
+            result["errors"].append(f"transcript load: {exc}")
+            self._finish_dream_run(dream_run_id, "error", error=str(exc))
+            return result
+
+        # 3. Write full transcript to dream workspace
+        transcript_dir = self._workspace / "transcript"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        (transcript_dir / "full.txt").write_text(full_text, encoding="utf-8")
+
+        # 4. Load prior extractions (same session only)
+        prior_extractions = self._load_prior_extractions(session_id)
+
+        # 5. Build prompt
+        prompt_text = build_dream_prompt(
+            compacted_transcript=compacted,
+            prior_extractions=prior_extractions,
+            project_name=project_name,
+        )
+
+        # 6. Spawn child process
+        try:
+            child_output = await self._spawn_child(prompt_text, cwd)
+        except subprocess.TimeoutExpired:
+            log.error("Dream child timed out for %s", session_id)
+            result["errors"].append("child timeout")
+            self._finish_dream_run(dream_run_id, "timeout")
+            return result
+        except Exception as exc:
+            log.error("Dream child failed for %s: %s", session_id, exc)
+            result["errors"].append(f"child spawn: {exc}")
+            self._finish_dream_run(dream_run_id, "error", error=str(exc))
+            return result
+
+        # 7. Parse JSON response
+        extraction_data = self._parse_response(child_output, result)
+
+        # 8. Process extractions
+        if extraction_data:
+            self._process_extractions(session_id, extraction_data, result)
+
+        # 9. Update dreamed_messages high-water mark
+        self._update_dreamed_messages(session_id)
+
+        # 10. Record result
+        self._finish_dream_run(
+            dream_run_id,
+            "completed",
+            extractions=(
+                result["created"]
+                + result["updated"]
+                + result["deprecated"]
+                + result["reinforced"]
+            ),
+        )
+
+        result["status"] = "completed"
+        return result
+
+    # ── internal helpers ─────────────────────────────────────────────────
+
+    def _create_dream_run(self) -> int:
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO oh_dream_runs (status) VALUES ('running') RETURNING run_id"
+        )
+        run_id = cur.fetchone()[0]
+        self._conn.commit()
+        return run_id
+
+    def _finish_dream_run(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        extractions: int = 0,
+        error: str | None = None,
+    ) -> None:
+        cur = self._conn.cursor()
+        cur.execute(
+            """UPDATE oh_dream_runs
+               SET finished_at = now(), status = %s,
+                   knowledge_extracted = %s, error_message = %s
+               WHERE run_id = %s""",
+            (status, extractions, error, run_id),
+        )
+        self._conn.commit()
+
+    def _load_prior_extractions(self, session_id: str) -> list[dict[str, Any]]:
+        cur = self._conn.cursor()
+        cur.execute(
+            """SELECT content_hash, knowledge_type, title, content, confidence
+               FROM oh_knowledge
+               WHERE source_session_id = %s AND archived = false
+               ORDER BY updated_at DESC""",
+            (session_id,),
+        )
+        return [
+            {
+                "content_hash": row[0],
+                "knowledge_type": row[1],
+                "title": row[2],
+                "content": row[3],
+                "confidence": row[4],
+            }
+            for row in cur.fetchall()
+        ]
+
+    async def _spawn_child(self, prompt_text: str, cwd: str | Path) -> str:
+        """Spawn `ohmo --print` and return stdout."""
+        cmd = [
+            sys.executable,
+            "-m",
+            "ohmo",
+            "--print",
+            prompt_text,
+            "--workspace",
+            str(self._workspace),
+            "--cwd",
+            str(Path(cwd).resolve()),
+            "--disallowed-tools",
+            "edit_file,write_file,bash,notebook_edit",
+        ]
+
+        log.info("Dream child spawn: cwd=%s workspace=%s", cwd, self._workspace)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=_CHILD_TASK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            raise subprocess.TimeoutExpired(cmd, _CHILD_TASK_TIMEOUT)
+
+        if process.returncode != 0:
+            err_text = stderr.decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"child exit={process.returncode}: {err_text}")
+
+        return stdout.decode("utf-8", errors="replace")
+
+    def _parse_response(
+        self, child_output: str, result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Parse child output as JSON.  Returns None on failure."""
+        # Strip markdown fences if present
+        text = child_output.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            log.error("Failed to parse dream child JSON: %s", exc)
+            result["errors"].append(f"json parse: {exc}")
+            return None
+
+        if not isinstance(data, dict) or "extractions" not in data:
+            result["errors"].append("missing 'extractions' key in response")
+            return None
+
+        return data
+
+    def _process_extractions(
+        self,
+        session_id: str,
+        data: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """Iterate extractions and upsert into oh_knowledge."""
+        extractions = data.get("extractions", [])
+        result["summary"] = data.get("summary", "")
+
+        for unit in extractions:
+            if not isinstance(unit, dict):
+                result["errors"].append("non-dict extraction item")
+                continue
+
+            # Validate required fields
+            source_turns = unit.get("source_turns", [])
+            if not source_turns or not isinstance(source_turns, list):
+                result["errors"].append(
+                    f"rejected '{unit.get('title', '?')}': missing source_turns"
+                )
+                continue
+
+            action = unit.get("action", "create")
+            if action not in ("create", "update", "deprecate", "reinforce"):
+                result["errors"].append(f"unknown action '{action}'")
+                continue
+
+            try:
+                if action == "create":
+                    self._upsert_create(session_id, unit, result)
+                elif action == "update":
+                    self._upsert_update(session_id, unit, result)
+                elif action == "deprecate":
+                    self._upsert_deprecate(unit, result)
+                elif action == "reinforce":
+                    self._upsert_reinforce(session_id, unit, result)
+            except Exception as exc:
+                result["errors"].append(f"upsert error: {exc}")
+                log.exception("Upsert failed for unit %s", unit.get("title", "?"))
+
+    def _compute_content_hash(self, content: str) -> str:
+        """SHA-256 hex of normalized content."""
+        import hashlib
+        normalized = " ".join(content.split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _upsert_create(
+        self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        content = unit.get("content", "")
+        content_hash = self._compute_content_hash(content)
+        evidence = json.dumps([{"session_id": session_id, "turns": unit["source_turns"]}])
+
+        cur = self._conn.cursor()
+        cur.execute(
+            """INSERT INTO oh_knowledge
+               (knowledge_type, title, content, confidence, source, source_session_id,
+                source_evidences, scope, content_hash)
+               VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+               ON CONFLICT (content_hash) WHERE NOT archived
+               DO NOTHING""",
+            (
+                unit.get("type", "FACT"),
+                unit.get("title", ""),
+                content,
+                unit.get("confidence", 0.3),
+                "dream",
+                session_id,
+                evidence,
+                unit.get("scope", "global"),
+                content_hash,
+            ),
+        )
+        if cur.rowcount:
+            result["created"] += 1
+        self._conn.commit()
+
+    def _upsert_update(
+        self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        unit_id = unit.get("id")
+        if not unit_id:
+            result["errors"].append("update missing 'id'")
+            return
+
+        source_turns = unit["source_turns"]
+        new_evidence = json.dumps({"session_id": session_id, "turns": source_turns})
+
+        cur = self._conn.cursor()
+        cur.execute(
+            """UPDATE oh_knowledge
+               SET content = COALESCE(%s, content),
+                   confidence = COALESCE(%s, confidence),
+                   scope = COALESCE(%s, scope),
+                   updated_at = now(),
+                   source_evidences = source_evidences || %s::jsonb
+               WHERE content_hash = %s AND archived = false""",
+            (
+                unit.get("content"),
+                unit.get("confidence"),
+                unit.get("scope"),
+                new_evidence,
+                unit_id,
+            ),
+        )
+        if cur.rowcount:
+            result["updated"] += 1
+        self._conn.commit()
+
+    def _upsert_deprecate(self, unit: dict[str, Any], result: dict[str, Any]) -> None:
+        unit_id = unit.get("id")
+        if not unit_id:
+            result["errors"].append("deprecate missing 'id'")
+            return
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE oh_knowledge SET archived = true, updated_at = now() WHERE content_hash = %s",
+            (unit_id,),
+        )
+        if cur.rowcount:
+            result["deprecated"] += 1
+        self._conn.commit()
+
+    def _upsert_reinforce(
+        self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        unit_id = unit.get("id")
+        if not unit_id:
+            result["errors"].append("reinforce missing 'id'")
+            return
+        new_evidence = json.dumps(
+            {"session_id": session_id, "turns": unit["source_turns"]}
+        )
+        cur = self._conn.cursor()
+        cur.execute(
+            """UPDATE oh_knowledge
+               SET source_evidences = source_evidences || %s::jsonb,
+                   updated_at = now(),
+                   confidence = COALESCE(%s, confidence)
+               WHERE content_hash = %s AND archived = false""",
+            (new_evidence, unit.get("confidence"), unit_id),
+        )
+        if cur.rowcount:
+            result["reinforced"] += 1
+        self._conn.commit()
+
+    def _update_dreamed_messages(self, session_id: str) -> None:
+        """Set the high‑water mark to the most recent message_id for this session."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT MAX(message_id) FROM oh_messages WHERE session_id = %s",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            cur.execute(
+                """INSERT INTO oh_dreamed_messages (session_id, last_message_id)
+                   VALUES (%s, %s)
+                   ON CONFLICT (session_id) DO UPDATE SET last_message_id = %s,
+                      dreamed_at = now()""",
+                (session_id, row[0], row[0]),
+            )
+        self._conn.commit()
+
+
+# ── milestone math helpers ────────────────────────────────────────────────
+
+def _next_milestone_after(count: int) -> int | None:
+    """Return the first milestone strictly greater than *count*."""
+    for m in sorted(_MILESTONES):
+        if count < m:
+            return m
+    # capped phase
+    if count < 80:
+        return 80
+    base = 80 + ((count - 80) // _CAP_INTERVAL + 1) * _CAP_INTERVAL
+    return base
