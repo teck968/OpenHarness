@@ -548,6 +548,10 @@ class OhmoSessionRuntimePool:
     ):
         if isinstance(event, AssistantTextDelta):
             reply_parts.append(event.text)
+            # New text arrived after a previous flush — reset so it gets
+            # flushed before the next tool (prevents lumping between tools).
+            if text_flushed[0]:
+                text_flushed[0] = False
             return
         if isinstance(event, CompactProgressEvent):
             logger.info(
@@ -595,8 +599,8 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionStarted):
-            # Flush any accumulated text as a progress update before tools fire,
-            # so intent/thinking text reaches the channel before tool hints.
+            # Flush accumulated text before tools fire so intent/thinking
+            # reaches the channel before the tool hint.
             if not text_flushed[0]:
                 text_flushed[0] = True
                 flushed = "".join(reply_parts).strip()
@@ -612,6 +616,8 @@ class OhmoSessionRuntimePool:
                         ),
                         metadata={"_progress": True, "_session_key": session_key},
                     )
+                # Clear so flushed text isn't duplicated in the final reply.
+                reply_parts.clear()
             summary = _summarize_tool_input(event.tool_name, event.tool_input)
             logger.info(
                 "ohmo runtime tool start session_key=%s session_id=%s tool=%s summary=%r",

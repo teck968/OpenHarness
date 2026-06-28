@@ -322,7 +322,7 @@ class OhmoGatewayBridge:
             OutboundMessage(
                 channel=message.channel,
                 chat_id=message.chat_id,
-                content=reply,
+                content="---\n" + reply,
                 media=final_media,
                 metadata={**inbound_meta, **final_metadata, "_session_key": session_key},
             )
