@@ -586,6 +586,15 @@ def create_default_command_registry(
         settings = getattr(context.engine, "_settings", None) or load_settings().materialize_active_profile()
         parts = args.split()
         action = parts[0] if parts else "run"
+
+        # PG‑backed dreaming (Stage 2) — inline PG check
+        try:
+            from openharness.services.pg_session import PostgresSessionBackend
+            if isinstance(context.session_backend, PostgresSessionBackend):
+                return await _pg_dream_run(args, context)
+        except ImportError:
+            pass
+
         backend = context.memory_backend if context.memory_backend is not None else None
         memory_dir = backend.get_memory_dir() if backend is not None else get_project_memory_dir(context.cwd)
         session_dir = context.session_backend.get_session_dir(context.cwd)
@@ -2781,3 +2790,130 @@ def _resolve_memory_candidate(memory_dir: Path, candidate: str) -> tuple[Path | 
     except ValueError:
         return None, True
     return resolved, False
+
+
+def _resolve_dream_workspace(context: CommandContext) -> Path:
+    """Resolve the dream workspace path."""
+    try:
+        from openharness.config.settings import load_settings
+        settings = load_settings()
+        if settings.postgres.enabled:
+            import os
+            ws_from_env = os.environ.get("OHMO_WORKSPACE", "")
+            return (Path(ws_from_env) if ws_from_env else Path.home() / ".ohmo") / "dream-workspace"
+    except Exception:
+        pass
+    dream_dir = Path(context.cwd) / ".openharness" / "dream-workspace"
+    dream_dir.mkdir(parents=True, exist_ok=True)
+    return dream_dir
+
+
+async def _pg_dream_run(args: str, context: CommandContext) -> CommandResult:
+    """PG‑backed dreaming via DreamingExecutor (Stage 2).
+
+    Called from ``_dream_handler`` when the session backend is
+    ``PostgresSessionBackend``.
+    """
+    from openharness.services.dreaming import DreamingExecutor
+    from openharness.services.pg_session import PostgresSessionBackend
+
+    assert isinstance(context.session_backend, PostgresSessionBackend)
+    conn = context.session_backend._ensure_connection()
+
+    parts = args.split()
+    action = parts[0].lower() if parts else "run"
+
+    if action == "sweep":
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT s.session_id, s.project_name, s.cwd, s.message_count
+               FROM oh_sessions s
+               LEFT JOIN oh_dreamed_messages dm ON dm.session_id = s.session_id
+               WHERE (s.ended_at IS NOT NULL
+                       OR (s.ended_at IS NULL AND s.updated_at < now() - interval '3 hours'))
+                 AND (dm.session_id IS NULL
+                      OR s.message_count - COALESCE(
+                          (SELECT COUNT(*) FROM oh_messages
+                           WHERE session_id = s.session_id
+                             AND message_id <= dm.last_message_id), 0
+                      ) >= 50)
+               ORDER BY s.message_count ASC
+               LIMIT 10"""
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return CommandResult(message="Dream sweep: no sessions need dreaming.")
+
+        dream_workspace = _resolve_dream_workspace(context)
+        executor = DreamingExecutor(conn, workspace=dream_workspace)
+
+        import asyncio
+        results: list[str] = []
+        for sid, proj_name, cwd_str, msg_count in rows:
+            try:
+                result = asyncio.get_event_loop().run_until_complete(
+                    executor.run_for_session(sid, cwd=cwd_str, project_name=proj_name)
+                )
+            except Exception:
+                result = await executor.run_for_session(sid, cwd=cwd_str, project_name=proj_name)
+            status = result.get("status", "?")
+            created = result.get("created", 0)
+            results.append(f"  {sid} ({proj_name}, {msg_count} msgs): {status} — {created} created")
+
+        return CommandResult(message=f"Dream sweep ({len(rows)} sessions):\n" + "\n".join(results))
+
+    if action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT session_id FROM oh_sessions WHERE session_id = %s", (context.session_id,))
+        has_session = cur.fetchone() is not None
+        return CommandResult(
+            message=(
+                "Dreams run automatically at milestones (10, 20, 40, 80, then every 100 messages). "
+                + ("Use /dream to run one now." if has_session else "No active session.")
+            )
+        )
+
+    if action not in ("run", "now", ""):
+        return CommandResult(message="Usage: /dream [run|now|sweep|status]")
+
+    if not context.session_id:
+        return CommandResult(message="No active session to dream.")
+
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT project_name FROM oh_sessions WHERE session_id = %s",
+        (context.session_id,),
+    )
+    row = cur.fetchone()
+    project_name = row[0] if row else "unknown"
+    cwd = str(Path(context.cwd).resolve())
+
+    dream_workspace = _resolve_dream_workspace(context)
+    executor = DreamingExecutor(conn, workspace=dream_workspace)
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        dream_result = loop.run_until_complete(
+            executor.run_for_session(
+                context.session_id,
+                cwd=cwd,
+                project_name=project_name,
+            )
+        )
+    except RuntimeError:
+        dream_result = {"status": "error", "errors": ["no event loop available"]}
+
+    result_text = (
+        f"Dream complete ({dream_result.get('status', '?')}):\n"
+        f"• Created: {dream_result.get('created', 0)}\n"
+        f"• Updated: {dream_result.get('updated', 0)}\n"
+        f"• Deprecated: {dream_result.get('deprecated', 0)}\n"
+        f"• Reinforced: {dream_result.get('reinforced', 0)}\n"
+        f"• Summary: {dream_result.get('summary', '-')}"
+    )
+    if dream_result.get("errors"):
+        error_list = dream_result["errors"][:3]
+        result_text += f"\n• Errors: {'; '.join(error_list)}"
+
+    return CommandResult(message=result_text)

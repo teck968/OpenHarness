@@ -708,3 +708,72 @@ def gateway_status_cmd(
 ) -> None:
     state = gateway_status(cwd, workspace)
     print(state.model_dump_json(indent=2))
+
+
+@gateway_app.command("sweep")
+def gateway_sweep_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Run a dream sweep and exit (for cron scheduling)."""
+    asyncio.run(_run_dream_sweep(workspace))
+
+
+async def _run_dream_sweep(workspace: str | None) -> None:
+    """Load workspace, connect to PG, run sweep, print results."""
+    from openharness.config.settings import load_settings
+    from openharness.services.pg_session import PostgresSessionBackend
+
+    ws = Path(workspace) if workspace else Path.home() / ".ohmo"
+    config_path = ws.parent / ".openharness" / "settings.json"
+    if not config_path.exists():
+        config_path = ws / ".openharness" / "settings.json"
+    if not config_path.exists():
+        print(f"No settings found near {ws}")
+        raise SystemExit(1)
+    settings = load_settings(config_path)
+    if not settings.postgres.enabled:
+        print("Postgres not enabled")
+        raise SystemExit(1)
+
+    backend = PostgresSessionBackend(settings.postgres.dsn, ca_bundle=settings.postgres.ca_bundle)
+    conn = backend._ensure_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT s.session_id, s.project_name, s.cwd, s.message_count
+           FROM oh_sessions s
+           LEFT JOIN oh_dreamed_messages dm ON dm.session_id = s.session_id
+           WHERE (s.ended_at IS NOT NULL
+                  OR (s.ended_at IS NULL AND s.updated_at < now() - interval '3 hours'))
+             AND (dm.session_id IS NULL
+                  OR s.message_count - COALESCE(
+                      (SELECT COUNT(*) FROM oh_messages
+                       WHERE session_id = s.session_id
+                         AND message_id <= dm.last_message_id), 0
+                  ) >= 50)
+           ORDER BY s.message_count ASC
+           LIMIT 10"""
+    )
+    rows = cur.fetchall()
+    if not rows:
+        print("Dream sweep: no sessions need dreaming.")
+        return
+
+    from openharness.services.dreaming import DreamingExecutor
+    dream_workspace = Path(ws) / "dream-workspace"
+    dream_workspace.mkdir(parents=True, exist_ok=True)
+    executor = DreamingExecutor(conn, workspace=dream_workspace)
+
+    import asyncio as _asyncio
+    for sid, proj_name, cwd_str, msg_count in rows:
+        try:
+            result = await executor.run_for_session(sid, cwd=cwd_str, project_name=proj_name)
+            status = result.get("status", "?")
+            created = result.get("created", 0)
+            print(f"  {sid} ({proj_name}, {msg_count} msgs): {status} — {created} created")
+        except Exception as exc:
+            print(f"  {sid}: error — {exc}")
+            import traceback
+            traceback.print_exc()
+
+    backend.close()
+    print("Dream sweep complete.")
