@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # Doubling milestones: 10, 20, 40, 80, then every 100 thereafter
 _MILESTONES = {10, 20, 40, 80}
 _CAP_INTERVAL = 100
-_CHILD_TASK_TIMEOUT = 180  # seconds — DeepSeek can be slow on large prompts
+_CHILD_TASK_TIMEOUT = 600  # seconds — large transcripts can take DeepSeek several minutes
 
 
 # ── public api ─────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ class DreamingExecutor:
 
         # 1. Create dream_run record
         if dream_run_id is None:
-            dream_run_id = self._create_dream_run()
+            dream_run_id = self._create_dream_run(session_id)
 
         # 2. Load transcript
         try:
@@ -183,10 +183,11 @@ class DreamingExecutor:
 
     # ── internal helpers ─────────────────────────────────────────────────
 
-    def _create_dream_run(self) -> int:
+    def _create_dream_run(self, session_id: str) -> int:
         cur = self._conn.cursor()
         cur.execute(
-            "INSERT INTO oh_dream_runs (status) VALUES ('running') RETURNING run_id"
+            "INSERT INTO oh_dream_runs (status, session_id) VALUES ('running', %s) RETURNING run_id",
+            (session_id,),
         )
         run_id = cur.fetchone()[0]
         self._conn.commit()
@@ -231,13 +232,19 @@ class DreamingExecutor:
         ]
 
     async def _spawn_child(self, prompt_text: str, cwd: str | Path) -> str:
-        """Spawn `ohmo --print` and return stdout."""
+        """Spawn `ohmo --print-file` and return stdout."""
+        # Write prompt to temp file (avoids Windows 32K command-line limit)
+        transcript_dir = self._workspace / "transcript"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        prompt_file = transcript_dir / "prompt.txt"
+        prompt_file.write_text(prompt_text, encoding="utf-8")
+
         cmd = [
             sys.executable,
             "-m",
             "ohmo",
-            "--print",
-            prompt_text,
+            "--print-file",
+            str(prompt_file),
             "--workspace",
             str(self._workspace),
             "--cwd",

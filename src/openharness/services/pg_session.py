@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -379,6 +379,16 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
                    WHERE source_evidences = '[]'::jsonb"""
             )
 
+        # v6 → v7: add session_id to oh_dream_runs for per‑session in‑flight guard
+        if current < 7:
+            cur.execute(
+                "ALTER TABLE oh_dream_runs ADD COLUMN IF NOT EXISTS session_id TEXT"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dream_runs_session "
+                "ON oh_dream_runs(session_id)"
+            )
+
         if current == 0:
             cur.execute(
                 "INSERT INTO oh_meta (key, value) VALUES ('schema_version', %s)",
@@ -530,6 +540,18 @@ class PostgresSessionBackend:
                 last_dreamed = count_row[0]
 
         if not executor.should_dream(message_count, last_dreamed):
+            return
+
+        # Guard against concurrent dream runs for this session
+        cur.execute(
+            "SELECT 1 FROM oh_dream_runs WHERE status = 'running' AND session_id = %s LIMIT 1",
+            (session_id,),
+        )
+        if cur.fetchone():
+            log.info(
+                "Dream skipped: a run is already in progress for session=%s",
+                session_id,
+            )
             return
 
         log.info(

@@ -448,6 +448,7 @@ def _build_gateway_logging_handlers(
 def main(
     ctx: typer.Context,
     print_mode: str | None = typer.Option(None, "--print", "-p", help="Run a single prompt and exit"),
+    print_file: str | None = typer.Option(None, "--print-file", help="Read prompt from a file and exit"),
     model: str | None = typer.Option(None, "--model", help="Model override for this session"),
     profile: str | None = typer.Option(None, "--profile", help="Provider profile to use"),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
@@ -496,11 +497,14 @@ def main(
             )
         )
 
-    if print_mode is not None:
+    if print_mode is not None or print_file is not None:
+        prompt_text = print_mode or ""
+        if print_file:
+            prompt_text = Path(print_file).read_text(encoding="utf-8")
         raise SystemExit(
             asyncio.run(
                 run_ohmo_print_mode(
-                    prompt=print_mode,
+                    prompt=prompt_text,
                     cwd=cwd_path,
                     workspace=workspace_root,
                     model=model,
