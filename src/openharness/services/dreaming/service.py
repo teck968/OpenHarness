@@ -111,6 +111,7 @@ class DreamingExecutor:
             "reinforced": 0,
             "errors": [],
             "summary": "",
+            "extractions_found": 0,
         }
 
         # 1. Create dream_run record
@@ -204,7 +205,8 @@ class DreamingExecutor:
         self._finish_dream_run(
             dream_run_id,
             "completed",
-            extractions=(
+            extractions_found=result["extractions_found"],
+            extractions_applied=(
                 result["created"]
                 + result["updated"]
                 + result["deprecated"]
@@ -232,16 +234,19 @@ class DreamingExecutor:
         run_id: int,
         status: str,
         *,
-        extractions: int = 0,
+        extractions_found: int = 0,
+        extractions_applied: int = 0,
         error: str | None = None,
     ) -> None:
         cur = self._conn.cursor()
         cur.execute(
             """UPDATE oh_dream_runs
                SET finished_at = now(), status = %s,
-                   knowledge_extracted = %s, error_message = %s
+                   knowledge_extracted = %s,
+                   extractions_found = %s,
+                   error_message = %s
                WHERE run_id = %s""",
-            (status, extractions, error, run_id),
+            (status, extractions_applied, extractions_found, error, run_id),
         )
         self._conn.commit()
 
@@ -412,10 +417,13 @@ class DreamingExecutor:
         """Iterate extractions and upsert into oh_knowledge."""
         extractions = data.get("extractions", [])
         result["summary"] = data.get("summary", "")
+        result["extractions_found"] = len(extractions)
+        total = len(extractions)
 
-        for unit in extractions:
+        for i, unit in enumerate(extractions):
             if not isinstance(unit, dict):
                 result["errors"].append("non-dict extraction item")
+                log.warning("Dream extraction %d/%d: REJECTED (non-dict)", i + 1, total)
                 continue
 
             # Validate required fields
@@ -424,25 +432,41 @@ class DreamingExecutor:
                 result["errors"].append(
                     f"rejected '{unit.get('title', '?')}': missing source_turns"
                 )
+                log.warning(
+                    "Dream extraction %d/%d: REJECTED '%s' (missing source_turns)",
+                    i + 1, total, unit.get("title", "?")[:80],
+                )
                 continue
 
             action = unit.get("action", "create")
             if action not in ("create", "update", "deprecate", "reinforce"):
                 result["errors"].append(f"unknown action '{action}'")
+                log.warning(
+                    "Dream extraction %d/%d: REJECTED '%s' (unknown action '%s')",
+                    i + 1, total, unit.get("title", "?")[:80], action,
+                )
                 continue
 
+            title = unit.get("title", "?")[:80]
             try:
+                disposition = None
                 if action == "create":
-                    self._upsert_create(session_id, unit, result)
+                    disposition = self._upsert_create(session_id, unit, result)
                 elif action == "update":
-                    self._upsert_update(session_id, unit, result)
+                    disposition = self._upsert_update(session_id, unit, result)
                 elif action == "deprecate":
-                    self._upsert_deprecate(unit, result)
+                    disposition = self._upsert_deprecate(unit, result)
                 elif action == "reinforce":
-                    self._upsert_reinforce(session_id, unit, result)
+                    disposition = self._upsert_reinforce(session_id, unit, result)
+
+                if disposition:
+                    log.info(
+                        "Dream extraction %d/%d: '%s' -> %s",
+                        i + 1, total, title, disposition,
+                    )
             except Exception as exc:
                 result["errors"].append(f"upsert error: {exc}")
-                log.exception("Upsert failed for unit %s", unit.get("title", "?"))
+                log.exception("Upsert failed for unit %s", title)
 
     def _compute_content_hash(self, content: str) -> str:
         """SHA-256 hex of normalized content."""
@@ -490,7 +514,7 @@ class DreamingExecutor:
 
     def _upsert_create(
         self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
-    ) -> None:
+    ) -> str:
         content = unit.get("content", "")
         content_hash = self._compute_content_hash(content)
         evidence = json.dumps([{"session_id": session_id, "turns": unit["source_turns"]}])
@@ -517,15 +541,26 @@ class DreamingExecutor:
         )
         if cur.rowcount:
             result["created"] += 1
-        self._conn.commit()
+            self._conn.commit()
+            return "CREATED"
+        else:
+            # Duplicate — find which existing unit has this hash
+            cur.execute(
+                "SELECT id FROM oh_knowledge WHERE content_hash = %s AND NOT archived",
+                (content_hash,),
+            )
+            row = cur.fetchone()
+            existing_id = row[0] if row else "?"
+            self._conn.commit()  # still commit (rollback not needed for DO NOTHING, but consistent)
+            return f"DUPLICATE (content_hash matches id={existing_id})"
 
     def _upsert_update(
         self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
-    ) -> None:
+    ) -> str:
         unit_id = unit.get("id")
         if not unit_id:
             result["errors"].append("update missing 'id'")
-            return
+            return "ERROR (missing id)"
 
         source_turns = unit["source_turns"]
         new_evidence = json.dumps({"session_id": session_id, "turns": source_turns})
@@ -549,13 +584,17 @@ class DreamingExecutor:
         )
         if cur.rowcount:
             result["updated"] += 1
-        self._conn.commit()
+            self._conn.commit()
+            return f"UPDATED (id={unit_id})"
+        else:
+            self._conn.commit()
+            return f"SKIPPED (id={unit_id} not found)"
 
-    def _upsert_deprecate(self, unit: dict[str, Any], result: dict[str, Any]) -> None:
+    def _upsert_deprecate(self, unit: dict[str, Any], result: dict[str, Any]) -> str:
         unit_id = unit.get("id")
         if not unit_id:
             result["errors"].append("deprecate missing 'id'")
-            return
+            return "ERROR (missing id)"
         cur = self._conn.cursor()
         cur.execute(
             "UPDATE oh_knowledge SET archived = true, updated_at = now() WHERE content_hash = %s",
@@ -563,15 +602,19 @@ class DreamingExecutor:
         )
         if cur.rowcount:
             result["deprecated"] += 1
-        self._conn.commit()
+            self._conn.commit()
+            return f"DEPRECATED (id={unit_id})"
+        else:
+            self._conn.commit()
+            return f"SKIPPED (id={unit_id} not found)"
 
     def _upsert_reinforce(
         self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
-    ) -> None:
+    ) -> str:
         unit_id = unit.get("id")
         if not unit_id:
             result["errors"].append("reinforce missing 'id'")
-            return
+            return "ERROR (missing id)"
         new_evidence = json.dumps(
             {"session_id": session_id, "turns": unit["source_turns"]}
         )
@@ -586,7 +629,11 @@ class DreamingExecutor:
         )
         if cur.rowcount:
             result["reinforced"] += 1
-        self._conn.commit()
+            self._conn.commit()
+            return f"REINFORCED (id={unit_id})"
+        else:
+            self._conn.commit()
+            return f"SKIPPED (id={unit_id} not found)"
 
     def _update_dreamed_messages(self, session_id: str) -> None:
         """Set the high‑water mark to the most recent message_id for this session."""

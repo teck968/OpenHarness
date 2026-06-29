@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -121,6 +121,7 @@ _SQL_CREATE_TABLES = [
         status              TEXT NOT NULL DEFAULT 'running',
         sessions_processed  INTEGER NOT NULL DEFAULT 0,
         knowledge_extracted INTEGER NOT NULL DEFAULT 0,
+        extractions_found   INTEGER NOT NULL DEFAULT 0,
         error_message       TEXT
     )
     """,
@@ -407,6 +408,12 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
                     recalled_at     TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
+
+        # v8 → v9: add extractions_found for observability (raw count vs applied)
+        if current < 9:
+            cur.execute(
+                "ALTER TABLE oh_dream_runs ADD COLUMN IF NOT EXISTS extractions_found INTEGER NOT NULL DEFAULT 0"
+            )
 
         if current == 0:
             cur.execute(
