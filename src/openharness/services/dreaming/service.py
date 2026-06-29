@@ -236,10 +236,10 @@ class DreamingExecutor:
     # ── internal helpers ─────────────────────────────────────────────────
 
     def _heal_stuck_runs(self) -> None:
-        """On startup, mark any lingering 'running' rows as 'error'.
+        """On startup, mark every 'running' row as 'error'.
 
-        Only marks rows that started more than 5 minutes ago to avoid
-        racing with a dream that is genuinely still executing.
+        Any 'running' row at startup is necessarily orphaned — the gateway
+        process that spawned the child died, so the child is dead too.
         """
         try:
             cur = self._conn.cursor()
@@ -247,15 +247,14 @@ class DreamingExecutor:
                 """UPDATE oh_dream_runs
                    SET finished_at = now(),
                        status = 'error',
-                       error_message = 'healed on startup: previous instance crashed'
-                   WHERE status = 'running'
-                     AND started_at < now() - interval '5 minutes'""",
+                       error_message = 'healed on startup: previous gateway instance crashed'
+                   WHERE status = 'running'""",
             )
             healed = cur.rowcount
             if healed:
                 self._conn.commit()
                 log.warning(
-                    "Healed %d stuck dream run(s) on startup (status=running -> error)",
+                    "Healed %d stuck dream run(s) on startup (running -> error)",
                     healed,
                 )
             else:
