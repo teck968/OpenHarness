@@ -35,6 +35,9 @@ class DiscordChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._http: httpx.AsyncClient | None = None
         self._bot_user_id: str | None = None
+        self._application_id: str | None = None
+        # Map channel_id -> {token, app_id} for interaction follow-ups
+        self._pending_interactions: dict[str, dict[str, str]] = {}
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -62,6 +65,7 @@ class DiscordChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop the Discord channel."""
         self._running = False
+        self._pending_interactions.clear()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
@@ -81,8 +85,18 @@ class DiscordChannel(BaseChannel):
             logger.warning("Discord HTTP client not initialized")
             return
 
-        url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        headers = {"Authorization": f"Bot {self.config.token}"}
+        # If this is the first reply after a slash command, use the interaction
+        # follow-up webhook so the response replaces the "bot is thinking" state.
+        interaction = self._pending_interactions.pop(msg.chat_id, None)
+        if interaction:
+            url = (
+                f"{DISCORD_API_BASE}/webhooks/"
+                f"{interaction['application_id']}/{interaction['token']}"
+            )
+            headers: dict[str, str] = {}  # webhook endpoint doesn't need auth
+        else:
+            url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
+            headers = {"Authorization": f"Bot {self.config.token}"}
 
         try:
             chunks = split_message(msg.content or "", MAX_MESSAGE_LEN)
@@ -154,9 +168,16 @@ class DiscordChannel(BaseChannel):
                 # Capture bot user ID for mention detection
                 user_data = payload.get("user") or {}
                 self._bot_user_id = user_data.get("id")
-                logger.info("Discord bot connected as user %s", self._bot_user_id)
+                # Capture application ID for slash-command registration
+                app_data = payload.get("application") or {}
+                self._application_id = app_data.get("id")
+                logger.info("Discord bot connected as user %s, app %s", self._bot_user_id, self._application_id)
+                # Register slash commands now that we're connected
+                await self._register_slash_commands()
             elif op == 0 and event_type == "MESSAGE_CREATE":
                 await self._handle_message_create(payload)
+            elif op == 0 and event_type == "INTERACTION_CREATE":
+                await self._handle_interaction_create(payload)
             elif op == 7:
                 # RECONNECT: exit loop to reconnect
                 logger.info("Discord gateway requested reconnect")
@@ -309,3 +330,134 @@ class DiscordChannel(BaseChannel):
         task = self._typing_tasks.pop(channel_id, None)
         if task:
             task.cancel()
+
+    # ── slash command registration ──────────────────────────────────────
+
+    async def _register_slash_commands(self) -> None:
+        """Register application commands with Discord after the READY handshake."""
+        if not self._application_id or not self._http:
+            logger.warning("Discord: cannot register slash commands (no app id or http client)")
+            return
+
+        url = f"{DISCORD_API_BASE}/applications/{self._application_id}/commands"
+        headers = {"Authorization": f"Bot {self.config.token}"}
+
+        commands = self._build_discord_commands()
+        try:
+            resp = await self._http.put(url, headers=headers, json=commands)
+            if resp.status_code == 200:
+                result = resp.json()
+                logger.info(
+                    "Discord: registered %d slash commands (app %s)",
+                    len(result) if isinstance(result, list) else 0,
+                    self._application_id,
+                )
+            else:
+                logger.error(
+                    "Discord: failed to register slash commands (HTTP %d): %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+        except Exception as exc:
+            logger.error("Discord: error registering slash commands: %s", exc)
+
+    def _build_discord_commands(self) -> list[dict[str, Any]]:
+        """Build the list of Discord application command payloads."""
+        commands: list[dict[str, Any]] = [
+            {
+                "name": "stop",
+                "description": "Stop the current running task",
+                "type": 1,  # CHAT_INPUT
+            },
+            {
+                "name": "restart",
+                "description": "Restart the gateway",
+                "type": 1,
+            },
+        ]
+
+        # Add commands from the OpenHarness registry (remote-invocable only)
+        try:
+            from openharness.commands.registry import get_command_registry
+
+            registry = get_command_registry()
+            for cmd in registry.list_commands():
+                if not getattr(cmd, "remote_invocable", True):
+                    continue
+                # Discord command names can only contain lowercase letters, numbers,
+                # and hyphens, and must be 3-32 chars. Skip skill commands with spaces.
+                name = cmd.name.lower().replace(" ", "-").replace("_", "-")
+                if len(name) < 3 or len(name) > 32:
+                    continue
+                commands.append({
+                    "name": name,
+                    "description": cmd.description[:100] if cmd.description else name,
+                    "type": 1,
+                })
+        except Exception as exc:
+            logger.warning("Discord: failed to load OpenHarness commands: %s", exc)
+
+        return commands
+
+    # ── interaction (slash command) handling ────────────────────────────
+
+    async def _handle_interaction_create(self, payload: dict[str, Any]) -> None:
+        """Handle a Discord interaction (slash command invocation)."""
+        if not self._http:
+            return
+
+        interaction_id = payload.get("id")
+        interaction_token = payload.get("token")
+        interaction_type = payload.get("type")
+
+        if interaction_type == 2:  # APPLICATION_COMMAND
+            data = payload.get("data") or {}
+            command_name = data.get("name", "")
+            user_data = payload.get("member", {}).get("user") or payload.get("user") or {}
+            sender_id = str(user_data.get("id", ""))
+            channel_id = str(payload.get("channel_id", ""))
+
+            logger.info(
+                "Discord slash command: /%s from user=%s channel=%s",
+                command_name, sender_id, channel_id,
+            )
+
+            # Acknowledge the interaction immediately (3-second timeout)
+            ack_url = f"{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+            ack_headers = {"Authorization": f"Bot {self.config.token}"}
+
+            try:
+                ack_resp = await self._http.post(ack_url, headers=ack_headers, json={
+                    "type": 5,  # DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE — "bot is thinking"
+                })
+                if ack_resp.status_code != 200:
+                    logger.error(
+                        "Discord: interaction ack failed (HTTP %d): %s",
+                        ack_resp.status_code, ack_resp.text[:300],
+                    )
+                    return
+            except Exception as exc:
+                logger.error("Discord: interaction ack error: %s", exc)
+                return
+
+            # Store interaction info so the first outbound reply to this channel
+            # uses the interaction follow-up webhook instead of a regular message.
+            self._pending_interactions[channel_id] = {
+                "token": interaction_token,
+                "application_id": self._application_id or "",
+            }
+
+            # Route the command as a text message through the normal pipeline
+            command_text = f"/{command_name}"
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=channel_id,
+                content=command_text,
+                media=[],
+                metadata={
+                    "message_id": str(payload.get("id", "")),
+                    "guild_id": payload.get("guild_id"),
+                    "interaction_token": interaction_token,
+                    "interaction_id": interaction_id,
+                },
+            )
