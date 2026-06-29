@@ -2958,6 +2958,17 @@ async def _pg_dream_run(args: str, context: CommandContext) -> CommandResult:
     cwd = str(Path(context.cwd).resolve())
 
     dream_workspace = _resolve_dream_workspace(context)
+
+    # Guard against concurrent dream runs
+    cur.execute(
+        "SELECT 1 FROM oh_dream_runs WHERE status = 'running' AND session_id = %s LIMIT 1",
+        (context.session_id,),
+    )
+    if cur.fetchone():
+        return CommandResult(
+            message="A dream is already in progress for this session. Wait for it to complete."
+        )
+
     executor = DreamingExecutor(conn, workspace=dream_workspace)
 
     import asyncio

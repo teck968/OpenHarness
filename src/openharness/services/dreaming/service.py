@@ -38,7 +38,6 @@ class DreamingExecutor:
     def __init__(self, conn: Any, *, workspace: Path) -> None:
         self._conn = conn
         self._workspace = Path(workspace)
-        self._heal_stuck_runs()
 
     # ── milestone detection ──────────────────────────────────────────────
 
@@ -119,6 +118,10 @@ class DreamingExecutor:
         if dream_run_id is None:
             dream_run_id = self._create_dream_run(session_id)
 
+        # 1b. Advance high-water mark immediately so concurrent milestone
+        # checks don't re-trigger while this dream is still running.
+        self._update_dreamed_messages(session_id)
+
         # 2. Load transcript
         try:
             compacted = load_compacted_transcript(self._conn, session_id)
@@ -198,9 +201,6 @@ class DreamingExecutor:
             result["errors"].append("post‑processing error")
             self._finish_dream_run(dream_run_id, "error")
             return result
-
-        # 11. Update dreamed_messages high-water mark
-        self._update_dreamed_messages(session_id)
 
         # 11. Record result
         extractions_applied = (

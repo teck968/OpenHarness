@@ -164,6 +164,7 @@ class OhmoSessionRuntimePool:
         dream_workspace = Path(self._workspace) / "dream-workspace"
         dream_workspace.mkdir(parents=True, exist_ok=True)
         executor = DreamingExecutor(conn, workspace=dream_workspace)
+        executor._heal_stuck_runs()  # heal once at startup
         import asyncio
         try:
             loop = asyncio.get_running_loop()
