@@ -165,6 +165,41 @@ class OhmoGatewayService:
         logger.info("ohmo gateway restarting in-place argv=%s", argv)
         os.execv(sys.executable, argv)
 
+    async def _heal_dreams_on_startup(self) -> None:
+        """Heal any dream runs left in 'running' state from a previous crash.
+
+        Separate from the per-session dreaming executor so it runs at gateway
+        startup, not lazily on first message.
+        """
+        try:
+            from openharness.services.pg_session import PostgresSessionBackend
+        except ImportError:
+            return
+        backend = self._runtime_pool._session_backend
+        if not isinstance(backend, PostgresSessionBackend):
+            return
+        try:
+            conn = backend._ensure_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """UPDATE oh_dream_runs
+                   SET finished_at = now(),
+                       status = 'error',
+                       error_message = 'healed on startup: previous gateway instance crashed'
+                   WHERE status = 'running'""",
+            )
+            healed = cur.rowcount
+            if healed:
+                conn.commit()
+                logger.warning(
+                    "Healed %d stuck dream run(s) on startup (running -> error)",
+                    healed,
+                )
+            else:
+                conn.rollback()
+        except Exception:
+            logger.exception("Failed to heal stuck dream runs on startup")
+
     async def _publish_pending_restart_notice(self) -> None:
         path = get_gateway_restart_notice_path(self._workspace)
         if not path.exists():
@@ -200,6 +235,9 @@ class OhmoGatewayService:
         self.write_state(running=True)
         bridge_task = asyncio.create_task(self._bridge.run(), name="ohmo-gateway-bridge")
         manager_task = asyncio.create_task(self._manager.start_all(), name="ohmo-gateway-channels")
+        # Heal stuck dream runs immediately after channel startup — don't wait
+        # for the first inbound message to trigger session creation.
+        heal_task = asyncio.create_task(self._heal_dreams_on_startup(), name="ohmo-heal-dreams")
         restart_notice_task = asyncio.create_task(
             self._publish_pending_restart_notice(),
             name="ohmo-gateway-restart-notice",
