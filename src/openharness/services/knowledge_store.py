@@ -120,8 +120,8 @@ class KnowledgeStore:
         *,
         top_k: int = 5,
         types: list[str] | None = None,
-        min_confidence: float = 0.5,
-        threshold: float = 0.7,
+        min_confidence: float = 0.3,
+        threshold: float = 0.45,
         session_id: str | None = None,
     ) -> list[KnowledgeUnit]:
         """Semantic recall — query → embedding → vector search → results."""
@@ -196,8 +196,8 @@ class KnowledgeStore:
         *,
         top_k: int = 5,
         types: list[str] | None = None,
-        min_confidence: float = 0.5,
-        threshold: float = 0.7,
+        min_confidence: float = 0.3,
+        threshold: float = 0.45,
     ) -> list[KnowledgeUnit]:
         """Recall using a pre‑computed embedding (avoids extra API call)."""
         cur = self._conn.cursor()

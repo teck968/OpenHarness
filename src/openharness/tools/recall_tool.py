@@ -68,8 +68,8 @@ class RecallTool(BaseTool):
             arguments.query,
             top_k=min(arguments.top_k, 20),
             types=type_list,
-            min_confidence=0.5,
-            threshold=0.65,
+            min_confidence=0.3,
+            threshold=0.45,
             session_id=context.metadata.get("session_id"),
         )
         if not results:

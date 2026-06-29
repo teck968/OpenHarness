@@ -279,6 +279,7 @@ class DreamingExecutor:
             "ohmo",
             "--print-file",
             str(prompt_file),
+            "--max-turns", "20",
             "--workspace",
             str(self._workspace),
             "--cwd",
