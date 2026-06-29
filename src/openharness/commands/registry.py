@@ -805,6 +805,74 @@ def create_default_command_registry(
     async def _hooks_handler(_: str, context: CommandContext) -> CommandResult:
         return CommandResult(message=context.hooks_summary or "No hooks configured.")
 
+    async def _remember_handler(args: str, context: CommandContext) -> CommandResult:
+        """Insert a knowledge unit manually into the Postgres knowledge base.
+
+        Usage: /remember <knowledge_type> <title> | <content>
+
+        Types: PREFERENCE, FACT, PATTERN, DECISION, RELATIONSHIP, CAVEAT, SELF_IMPROVEMENT
+        """
+        from openharness.services.knowledge_store import get_knowledge_store, KnowledgeUnit
+
+        store = get_knowledge_store()
+        if store is None:
+            return CommandResult(message="Knowledge store not available. The gateway must be running with PG backend.")
+
+        import asyncio
+
+        text = args.strip()
+        if not text:
+            return CommandResult(
+                message=(
+                    "Usage: /remember <type> <title> | <content>\n"
+                    "Types: PREFERENCE, FACT, PATTERN, DECISION, RELATIONSHIP, CAVEAT, SELF_IMPROVEMENT\n"
+                    "Example: /remember PREFERENCE git commits | Jeremy prefers atomic commits with descriptive messages"
+                )
+            )
+
+        parts = text.split("|", 1)
+        if len(parts) != 2:
+            return CommandResult(
+                message="Expected: /remember <type> <title> | <content>. Use '|' to separate title from content."
+            )
+
+        header = parts[0].strip().split(None, 1)
+        if len(header) < 2:
+            return CommandResult(
+                message="Expected: /remember <type> <title> | <content>. Both a type and title are required."
+            )
+
+        knowledge_type = header[0].upper()
+        valid_types = {"PREFERENCE", "FACT", "PATTERN", "DECISION", "RELATIONSHIP", "CAVEAT", "SELF_IMPROVEMENT"}
+        if knowledge_type not in valid_types:
+            return CommandResult(
+                message=f"Unknown type '{knowledge_type}'. Valid: {', '.join(sorted(valid_types))}"
+            )
+
+        title = header[1].strip()
+        content = parts[1].strip()
+        if not content:
+            return CommandResult(message="Content is required after '|'.")
+
+        unit = KnowledgeUnit(
+            knowledge_type=knowledge_type,
+            title=title,
+            content=content,
+            confidence=0.9,
+            source="manual",
+            source_session_id=context.session_id,
+        )
+
+        try:
+            kid = await store.insert(unit)
+        except Exception as exc:
+            return CommandResult(message=f"Failed to store knowledge: {exc}")
+
+        if kid is None:
+            return CommandResult(message=f"Knowledge unit '{title}' already exists (duplicate content).")
+
+        return CommandResult(message=f"Stored knowledge unit #{kid} [{knowledge_type}] {title}")
+
     async def _resume_handler(args: str, context: CommandContext) -> CommandResult:
         tokens = args.strip().split()
 
@@ -2349,6 +2417,7 @@ def create_default_command_registry(
     registry.register(SlashCommand("usage", "Show usage and token estimates", _usage_handler))
     registry.register(SlashCommand("stats", "Show session statistics", _stats_handler))
     registry.register(SlashCommand("dream", "Consolidate memory", _dream_handler))
+    registry.register(SlashCommand("remember", "Store a knowledge unit manually", _remember_handler))
     registry.register(SlashCommand("memory", "Inspect and manage project memory", _memory_handler))
     registry.register(SlashCommand("hooks", "Show configured hooks", _hooks_handler))
     registry.register(
