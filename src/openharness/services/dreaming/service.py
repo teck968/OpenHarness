@@ -202,10 +202,7 @@ class DreamingExecutor:
             self._finish_dream_run(dream_run_id, "error")
             return result
 
-        # 11. Advance high-water again to catch messages added during dream
-        self._update_dreamed_messages(session_id)
-
-        # 12. Record result
+        # 11. Record result
         extractions_applied = (
             result["created"]
             + result["updated"]

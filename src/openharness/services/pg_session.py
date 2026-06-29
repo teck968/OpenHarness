@@ -563,6 +563,17 @@ class PostgresSessionBackend:
         last_dreamed = row[0] if row and row[0] is not None else 0
 
         if not executor.should_dream(total_count, last_dreamed):
+            # Catch up the high-water to the current count so future snapshots
+            # measure deltas correctly. We only do this when no dream fires
+            # because a running dream hasn't completed its processing yet.
+            cur.execute(
+                """INSERT INTO oh_dreamed_messages (session_id, last_message_id)
+                   VALUES (%s, %s)
+                   ON CONFLICT (session_id) DO UPDATE SET last_message_id = %s,
+                      dreamed_at = now()""",
+                (session_id, total_count, total_count),
+            )
+            conn.commit()
             return
 
         # Guard against concurrent dream runs for this session
@@ -575,21 +586,29 @@ class PostgresSessionBackend:
                 "Dream skipped: a run is already in progress for session=%s",
                 session_id,
             )
-            return
-
-        # Re-read dreamed_messages after in-flight guard — a concurrent dream
-        # (e.g. from /dream command) may have committed its high-water advance
-        # between our first read and now.
-        # Value is now stored as message count directly (no conversion needed).
-        cur.execute(
-            "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
-            (session_id,),
-        )
-        row2 = cur.fetchone()
-        if row2 and row2[0] is not None:
-            last_dreamed = row2[0]
-
-        if not executor.should_dream(total_count, last_dreamed):
+            # Re-check: the running dream may have just completed and advanced
+            # the high-water. If total_count now matches, catch up and return.
+            cur.execute(
+                "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
+                (session_id,),
+            )
+            row2 = cur.fetchone()
+            if row2 and row2[0] is not None:
+                last_dreamed = row2[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s",
+                (session_id,),
+            )
+            total_count = cur.fetchone()[0]
+            if not executor.should_dream(total_count, last_dreamed):
+                cur.execute(
+                    """INSERT INTO oh_dreamed_messages (session_id, last_message_id)
+                       VALUES (%s, %s)
+                       ON CONFLICT (session_id) DO UPDATE SET last_message_id = %s,
+                          dreamed_at = now()""",
+                    (session_id, total_count, total_count),
+                )
+                conn.commit()
             return
 
         log.info(
