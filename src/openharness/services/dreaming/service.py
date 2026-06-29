@@ -38,6 +38,7 @@ class DreamingExecutor:
     def __init__(self, conn: Any, *, workspace: Path) -> None:
         self._conn = conn
         self._workspace = Path(workspace)
+        self._heal_stuck_runs()
 
     # ── milestone detection ──────────────────────────────────────────────
 
@@ -158,7 +159,7 @@ class DreamingExecutor:
             return result
 
         # 7. Parse JSON response
-        extraction_data = self._parse_response(child_output, result)
+        extraction_data = self._parse_response(child_output, result, dream_run_id=dream_run_id)
 
         # Steps 8‑10 (reinforce + extractions + embedding backfill) wrapped
         # in a timeout so stuck API calls don't leave orphaned running rows.
@@ -202,22 +203,65 @@ class DreamingExecutor:
         self._update_dreamed_messages(session_id)
 
         # 11. Record result
+        extractions_applied = (
+            result["created"]
+            + result["updated"]
+            + result["deprecated"]
+            + result["reinforced"]
+        )
         self._finish_dream_run(
             dream_run_id,
             "completed",
             extractions_found=result["extractions_found"],
-            extractions_applied=(
-                result["created"]
-                + result["updated"]
-                + result["deprecated"]
-                + result["reinforced"]
-            ),
+            extractions_applied=extractions_applied,
+        )
+
+        log.info(
+            "Dream run %d completed: %d extractions found, "
+            "%d created, %d updated, %d reinforced, %d deprecated, "
+            "%d duplicates, %d errors",
+            dream_run_id,
+            result["extractions_found"],
+            result["created"],
+            result["updated"],
+            result["reinforced"],
+            result["deprecated"],
+            result["extractions_found"] - extractions_applied - len(result["errors"]),
+            len(result["errors"]),
         )
 
         result["status"] = "completed"
         return result
 
     # ── internal helpers ─────────────────────────────────────────────────
+
+    def _heal_stuck_runs(self) -> None:
+        """On startup, mark any lingering 'running' rows as 'error'.
+
+        Only marks rows that started more than 5 minutes ago to avoid
+        racing with a dream that is genuinely still executing.
+        """
+        try:
+            cur = self._conn.cursor()
+            cur.execute(
+                """UPDATE oh_dream_runs
+                   SET finished_at = now(),
+                       status = 'error',
+                       error_message = 'healed on startup: previous instance crashed'
+                   WHERE status = 'running'
+                     AND started_at < now() - interval '5 minutes'""",
+            )
+            healed = cur.rowcount
+            if healed:
+                self._conn.commit()
+                log.warning(
+                    "Healed %d stuck dream run(s) on startup (status=running -> error)",
+                    healed,
+                )
+            else:
+                self._conn.rollback()
+        except Exception:
+            log.exception("Failed to heal stuck dream runs on startup")
 
     def _create_dream_run(self, session_id: str) -> int:
         cur = self._conn.cursor()
@@ -317,9 +361,24 @@ class DreamingExecutor:
         return stdout.decode("utf-8", errors="replace")
 
     def _parse_response(
-        self, child_output: str, result: dict[str, Any]
+        self, child_output: str, result: dict[str, Any], dream_run_id: int | None = None,
     ) -> dict[str, Any] | None:
-        """Parse child output as JSON.  Returns None on failure."""
+        """Parse child output as JSON.  Returns None on failure.
+
+        Saves raw output to the dream workspace under transcript/response.txt
+        for post-mortem debugging when parsing fails.
+        """
+        # Save raw output before any parsing (debuggability)
+        try:
+            transcript_dir = self._workspace / "transcript"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            suffix = f"-{dream_run_id}" if dream_run_id else ""
+            (transcript_dir / f"response{suffix}.txt").write_text(
+                child_output, encoding="utf-8"
+            )
+        except Exception:
+            pass  # non-critical
+
         text = child_output.strip()
         # Extract JSON block — model may output analysis text before/after
         # Look for ```json ... ``` fences first
@@ -351,8 +410,14 @@ class DreamingExecutor:
 
         if not isinstance(data, dict) or "extractions" not in data:
             result["errors"].append("missing 'extractions' key in response")
+            log.error("Dream child response missing 'extractions' key")
             return None
 
+        extractions = data.get("extractions", [])
+        log.info(
+            "Dream child parsed: %d extractions in response",
+            len(extractions) if isinstance(extractions, list) else 0,
+        )
         return data
 
     async def _cross_session_reinforce(
