@@ -768,7 +768,7 @@ async def _run_dream_sweep(workspace: str | None) -> None:
     from openharness.services.dreaming import DreamingExecutor
     dream_workspace = Path(ws) / "dream-workspace"
     dream_workspace.mkdir(parents=True, exist_ok=True)
-    executor = DreamingExecutor(conn, workspace=dream_workspace)
+    executor = DreamingExecutor(backend._dsn, workspace=dream_workspace)
 
     import asyncio as _asyncio
     for sid, proj_name, cwd_str, msg_count in rows:

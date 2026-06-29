@@ -2914,7 +2914,7 @@ async def _pg_dream_run(args: str, context: CommandContext) -> CommandResult:
             return CommandResult(message="Dream sweep: no sessions need dreaming.")
 
         dream_workspace = _resolve_dream_workspace(context)
-        executor = DreamingExecutor(conn, workspace=dream_workspace)
+        executor = DreamingExecutor(context.session_backend._dsn, workspace=dream_workspace)
 
         import asyncio
         results: list[str] = []
@@ -2969,7 +2969,7 @@ async def _pg_dream_run(args: str, context: CommandContext) -> CommandResult:
             message="A dream is already in progress for this session. Wait for it to complete."
         )
 
-    executor = DreamingExecutor(conn, workspace=dream_workspace)
+    executor = DreamingExecutor(context.session_backend._dsn, workspace=dream_workspace)
 
     import asyncio
     try:

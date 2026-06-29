@@ -35,8 +35,12 @@ _CHILD_TASK_TIMEOUT = 600  # seconds — large transcripts can take DeepSeek sev
 class DreamingExecutor:
     """Orchestrate a dream run for a single session."""
 
-    def __init__(self, conn: Any, *, workspace: Path) -> None:
-        self._conn = conn
+    def __init__(self, dsn: str, *, workspace: Path) -> None:
+        import psycopg2
+        self._conn = psycopg2.connect(
+            dsn,
+            options="-c idle_in_transaction_session_timeout=300000",  # 5 min
+        )
         self._workspace = Path(workspace)
 
     # ── milestone detection ──────────────────────────────────────────────

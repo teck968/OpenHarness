@@ -161,9 +161,10 @@ class OhmoSessionRuntimePool:
             return  # already wired
         from openharness.services.dreaming import DreamingExecutor
         conn = self._session_backend._ensure_connection()
+        dsn = self._session_backend._dsn
         dream_workspace = Path(self._workspace) / "dream-workspace"
         dream_workspace.mkdir(parents=True, exist_ok=True)
-        executor = DreamingExecutor(conn, workspace=dream_workspace)
+        executor = DreamingExecutor(dsn, workspace=dream_workspace)
         executor._heal_stuck_runs()  # safety net: also heal on first session creation
         import asyncio
         try:
