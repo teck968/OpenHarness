@@ -27,6 +27,7 @@ from openharness.tools.mcp_auth_tool import McpAuthTool
 from openharness.tools.mcp_tool import McpToolAdapter
 from openharness.tools.notebook_edit_tool import NotebookEditTool
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
+from openharness.tools.recall_tool import RecallTool
 from openharness.tools.remote_trigger_tool import RemoteTriggerTool
 from openharness.tools.send_message_tool import SendMessageTool
 from openharness.tools.skill_tool import SkillTool
@@ -88,6 +89,7 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         SendMessageTool(),
         TeamCreateTool(),
         TeamDeleteTool(),
+        RecallTool(),
     ):
         registry.register(tool)
     if mcp_manager is not None:

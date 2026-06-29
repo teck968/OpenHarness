@@ -150,7 +150,7 @@ class OhmoSessionRuntimePool:
         return result
 
     def _wire_dreaming_if_pg_backend(self) -> None:
-        """Wire milestone-triggered dreaming if session backend is PG."""
+        """Wire milestone-triggered dreaming and knowledge store if session backend is PG."""
         try:
             from openharness.services.pg_session import PostgresSessionBackend
         except ImportError:
@@ -171,6 +171,32 @@ class OhmoSessionRuntimePool:
             logger.info("Gateway dreaming executor wired")
         except RuntimeError:
             logger.warning("Gateway dreaming deferred — no event loop")
+
+        # Wire knowledge store for recall tool + cross‑session reinforcement
+        try:
+            from openharness.auth.storage import load_credential
+            from openharness.services.embedding import EmbeddingService
+            from openharness.services.knowledge_store import (
+                KnowledgeStore,
+                set_knowledge_store,
+            )
+            api_key = load_credential("openai", "api_key")
+            if api_key:
+                embedding = EmbeddingService(
+                    backend="openai",
+                    model="text-embedding-3-small",
+                    api_key=api_key,
+                    dimensions=1536,
+                )
+                store = KnowledgeStore(conn, embedding)
+                set_knowledge_store(store)
+                logger.info("Gateway knowledge store wired")
+            else:
+                logger.warning(
+                    "Gateway knowledge store skipped — no OpenAI API key"
+                )
+        except Exception:
+            logger.exception("Gateway knowledge store wiring failed")
 
     async def get_bundle(
         self,

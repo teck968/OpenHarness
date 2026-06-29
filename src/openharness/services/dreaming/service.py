@@ -159,14 +159,19 @@ class DreamingExecutor:
         # 7. Parse JSON response
         extraction_data = self._parse_response(child_output, result)
 
-        # 8. Process extractions
+        # 8. Cross‑session reinforcement: find similar existing knowledge
+        #    and merge "create" actions into "reinforce" when a match is found.
+        if extraction_data:
+            await self._cross_session_reinforce(session_id, extraction_data, result)
+
+        # 9. Process extractions
         if extraction_data:
             self._process_extractions(session_id, extraction_data, result)
 
-        # 9. Update dreamed_messages high-water mark
+        # 10. Update dreamed_messages high-water mark
         self._update_dreamed_messages(session_id)
 
-        # 10. Record result
+        # 11. Record result
         self._finish_dream_run(
             dream_run_id,
             "completed",
@@ -314,6 +319,59 @@ class DreamingExecutor:
             return None
 
         return data
+
+    async def _cross_session_reinforce(
+        self,
+        session_id: str,
+        data: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """For each 'create' extraction, check if similar knowledge exists
+        across all sessions via embedding similarity.  If a match is found
+        (cosine similarity >= 0.85), convert the action to 'reinforce' so
+        the existing unit gets new evidence rather than creating a duplicate."""
+        try:
+            from openharness.services.knowledge_store import get_knowledge_store
+        except ImportError:
+            return
+        store = get_knowledge_store()
+        if store is None:
+            return
+
+        extractions = data.get("extractions", [])
+        for i, unit in enumerate(extractions):
+            if not isinstance(unit, dict):
+                continue
+            if unit.get("action", "create") != "create":
+                continue
+
+            unit_type = unit.get("type", "FACT")
+            title = unit.get("title", "")
+            content = unit.get("content", "")
+            query_text = f"{title}: {content}"
+
+            try:
+                matches = await store.recall(
+                    query_text,
+                    top_k=3,
+                    types=[unit_type],
+                    min_confidence=0.3,
+                    threshold=0.85,
+                )
+            except Exception:
+                continue
+
+            if matches and matches[0].similarity and matches[0].similarity >= 0.85:
+                best = matches[0]
+                if best.source_session_id != session_id:
+                    # Found similar knowledge from another session — reinforce
+                    unit["action"] = "reinforce"
+                    unit["id"] = best.id
+                    log.info(
+                        "Cross‑session reinforce: '%s' matches unit %d "
+                        "(similarity=%.2f, from session %s)",
+                        title, best.id, best.similarity, best.source_session_id,
+                    )
 
     def _process_extractions(
         self,

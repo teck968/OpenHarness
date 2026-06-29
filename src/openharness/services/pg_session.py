@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SQL_CREATE_TABLES = [
     # ── meta ────────────────────────────────────────────────────────────────
@@ -388,6 +388,25 @@ def _migrate_schema(conn: "psycopg2.extensions.connection") -> None:
                 "CREATE INDEX IF NOT EXISTS idx_dream_runs_session "
                 "ON oh_dream_runs(session_id)"
             )
+
+        # v7 → v8: HNSW index for knowledge embeddings + recall log table
+        if current < 8:
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_embedding "
+                "ON oh_knowledge USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 200)"
+            )
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS oh_knowledge_recalls (
+                    id              BIGSERIAL PRIMARY KEY,
+                    session_id      TEXT NOT NULL,
+                    query_text      TEXT NOT NULL,
+                    query_embedding VECTOR(1536),
+                    recalled_ids    BIGINT[] NOT NULL,
+                    distances       REAL[] NOT NULL,
+                    recalled_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
 
         if current == 0:
             cur.execute(
