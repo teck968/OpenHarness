@@ -38,6 +38,7 @@ class DiscordChannel(BaseChannel):
         self._application_id: str | None = None
         # Map channel_id -> {token, app_id} for interaction follow-ups
         self._pending_interactions: dict[str, dict[str, str]] = {}
+        self._guild_ids: list[str] = []
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -171,8 +172,14 @@ class DiscordChannel(BaseChannel):
                 # Capture application ID for slash-command registration
                 app_data = payload.get("application") or {}
                 self._application_id = app_data.get("id")
-                logger.info("Discord bot connected as user %s, app %s", self._bot_user_id, self._application_id)
-                # Register slash commands now that we're connected
+                # Capture guild IDs for guild-scoped command registration (instant)
+                guilds = payload.get("guilds") or []
+                self._guild_ids = [str(g.get("id")) for g in guilds if g.get("id")]
+                logger.info(
+                    "Discord bot connected as user %s, app %s, guilds %s",
+                    self._bot_user_id, self._application_id, self._guild_ids,
+                )
+                # Register slash commands now (guild-scoped for instant visibility)
                 await self._register_slash_commands()
             elif op == 0 and event_type == "MESSAGE_CREATE":
                 await self._handle_message_create(payload)
@@ -334,32 +341,56 @@ class DiscordChannel(BaseChannel):
     # ── slash command registration ──────────────────────────────────────
 
     async def _register_slash_commands(self) -> None:
-        """Register application commands with Discord after the READY handshake."""
+        """Register application commands with Discord after the READY handshake.
+
+        Guild commands appear instantly; global commands take up to an hour.
+        We register per-guild for every guild the bot is in, plus a global
+        pass as fallback.
+        """
         if not self._application_id or not self._http:
             logger.warning("Discord: cannot register slash commands (no app id or http client)")
             return
 
-        url = f"{DISCORD_API_BASE}/applications/{self._application_id}/commands"
+        commands = self._build_discord_commands()
         headers = {"Authorization": f"Bot {self.config.token}"}
 
-        commands = self._build_discord_commands()
+        # 1. Register per-guild (instant visibility)
+        for guild_id in self._guild_ids:
+            url = f"{DISCORD_API_BASE}/applications/{self._application_id}/guilds/{guild_id}/commands"
+            try:
+                resp = await self._http.put(url, headers=headers, json=commands)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    logger.info(
+                        "Discord: registered %d guild commands for guild %s",
+                        len(result) if isinstance(result, list) else 0,
+                        guild_id,
+                    )
+                else:
+                    logger.error(
+                        "Discord: guild command registration failed for %s (HTTP %d): %s",
+                        guild_id, resp.status_code, resp.text[:300],
+                    )
+            except Exception as exc:
+                logger.error("Discord: guild command registration error for %s: %s", guild_id, exc)
+
+        # 2. Also register globally (takes effect ~1hr, covers DMs)
         try:
+            url = f"{DISCORD_API_BASE}/applications/{self._application_id}/commands"
             resp = await self._http.put(url, headers=headers, json=commands)
             if resp.status_code == 200:
                 result = resp.json()
                 logger.info(
-                    "Discord: registered %d slash commands (app %s)",
+                    "Discord: registered %d global commands",
                     len(result) if isinstance(result, list) else 0,
-                    self._application_id,
                 )
             else:
                 logger.error(
-                    "Discord: failed to register slash commands (HTTP %d): %s",
-                    resp.status_code,
-                    resp.text[:500],
+                    "Discord: global command registration failed (HTTP %d): %s",
+                    resp.status_code, resp.text[:300],
                 )
         except Exception as exc:
-            logger.error("Discord: error registering slash commands: %s", exc)
+            logger.error("Discord: global command registration error: %s", exc)
 
     def _build_discord_commands(self) -> list[dict[str, Any]]:
         """Build the list of Discord application command payloads."""
