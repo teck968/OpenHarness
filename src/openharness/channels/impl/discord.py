@@ -474,7 +474,7 @@ class DiscordChannel(BaseChannel):
                 ack_resp = await self._http.post(ack_url, headers=ack_headers, json={
                     "type": 5,  # DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE — "bot is thinking"
                 })
-                if ack_resp.status_code != 200:
+                if ack_resp.status_code not in (200, 204):
                     logger.error(
                         "Discord: interaction ack failed (HTTP %d): %s",
                         ack_resp.status_code, ack_resp.text[:300],
