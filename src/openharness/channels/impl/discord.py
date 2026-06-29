@@ -376,26 +376,39 @@ class DiscordChannel(BaseChannel):
             },
         ]
 
-        # Add commands from the OpenHarness registry (remote-invocable only)
+        # Try the full registry; fall back to hardcoded known commands
         try:
-            from openharness.commands.registry import get_command_registry
+            from openharness.commands.registry import (
+                create_default_command_registry,
+            )
 
-            registry = get_command_registry()
+            registry = create_default_command_registry(
+                workspace=None,
+            )
             for cmd in registry.list_commands():
                 if not getattr(cmd, "remote_invocable", True):
                     continue
-                # Discord command names can only contain lowercase letters, numbers,
-                # and hyphens, and must be 3-32 chars. Skip skill commands with spaces.
                 name = cmd.name.lower().replace(" ", "-").replace("_", "-")
                 if len(name) < 3 or len(name) > 32:
                     continue
                 commands.append({
                     "name": name,
-                    "description": cmd.description[:100] if cmd.description else name,
+                    "description": (cmd.description or name)[:100],
                     "type": 1,
                 })
         except Exception as exc:
-            logger.warning("Discord: failed to load OpenHarness commands: %s", exc)
+            extra = [
+                ("remember", "Save a fact, preference, or lesson to long-term memory"),
+                ("help", "List available commands"),
+                ("dream", "Trigger a knowledge consolidation run"),
+                ("echo", "Echo back the input message"),
+            ]
+            for name, desc in extra:
+                commands.append({"name": name, "description": desc, "type": 1})
+            logger.warning(
+                "Discord: fell back to hardcoded command list (registry unavailable: %s)",
+                exc,
+            )
 
         return commands
 
