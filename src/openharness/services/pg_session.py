@@ -505,21 +505,13 @@ class PostgresSessionBackend:
         if self._dreaming_executor is not None and self._dreaming_event_loop is not None:
             executor = self._dreaming_executor
 
-            # Get last dreamed count
+            # Get last dreamed count — now stored as message count directly
             cur.execute(
                 "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
                 (session_id,),
             )
             row = cur.fetchone()
-            last_dreamed = 0
-            if row is not None:
-                cur.execute(
-                    "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
-                    (session_id, row[0]),
-                )
-                count_row = cur.fetchone()
-                if count_row:
-                    last_dreamed = count_row[0]
+            last_dreamed = row[0] if row and row[0] is not None else 0
 
             if executor.should_dream_on_end(message_count, last_dreamed):
                 log.info(
@@ -562,21 +554,13 @@ class PostgresSessionBackend:
         )
         total_count = cur.fetchone()[0]
 
-        # Get last dreamed count
+        # Get last dreamed count — now stored as a message count directly
         cur.execute(
             "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
             (session_id,),
         )
         row = cur.fetchone()
-        last_dreamed = 0
-        if row is not None:
-            cur.execute(
-                "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
-                (session_id, row[0]),
-            )
-            count_row = cur.fetchone()
-            if count_row:
-                last_dreamed = count_row[0]
+        last_dreamed = row[0] if row and row[0] is not None else 0
 
         if not executor.should_dream(total_count, last_dreamed):
             return
@@ -596,19 +580,14 @@ class PostgresSessionBackend:
         # Re-read dreamed_messages after in-flight guard — a concurrent dream
         # (e.g. from /dream command) may have committed its high-water advance
         # between our first read and now.
+        # Value is now stored as message count directly (no conversion needed).
         cur.execute(
             "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
             (session_id,),
         )
         row2 = cur.fetchone()
-        if row2 is not None:
-            cur.execute(
-                "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
-                (session_id, row2[0]),
-            )
-            count_row2 = cur.fetchone()
-            if count_row2:
-                last_dreamed = count_row2[0]
+        if row2 and row2[0] is not None:
+            last_dreamed = row2[0]
 
         if not executor.should_dream(total_count, last_dreamed):
             return

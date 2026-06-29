@@ -703,10 +703,14 @@ class DreamingExecutor:
             return f"SKIPPED (id={unit_id} not found)"
 
     def _update_dreamed_messages(self, session_id: str) -> None:
-        """Set the high‑water mark to the most recent message_id for this session."""
+        """Set the high‑water mark to the current message count for this session.
+
+        Uses COUNT directly to avoid message_id gaps (dream child sessions
+        consume global id sequence but don't belong to this session_id).
+        """
         cur = self._conn.cursor()
         cur.execute(
-            "SELECT MAX(message_id) FROM oh_messages WHERE session_id = %s",
+            "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s",
             (session_id,),
         )
         row = cur.fetchone()
