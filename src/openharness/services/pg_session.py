@@ -593,6 +593,26 @@ class PostgresSessionBackend:
             )
             return
 
+        # Re-read dreamed_messages after in-flight guard — a concurrent dream
+        # (e.g. from /dream command) may have committed its high-water advance
+        # between our first read and now.
+        cur.execute(
+            "SELECT last_message_id FROM oh_dreamed_messages WHERE session_id = %s",
+            (session_id,),
+        )
+        row2 = cur.fetchone()
+        if row2 is not None:
+            cur.execute(
+                "SELECT COUNT(*) FROM oh_messages WHERE session_id = %s AND message_id <= %s",
+                (session_id, row2[0]),
+            )
+            count_row2 = cur.fetchone()
+            if count_row2:
+                last_dreamed = count_row2[0]
+
+        if not executor.should_dream(total_count, last_dreamed):
+            return
+
         log.info(
             "Dream milestone triggered: session=%s count=%d last_dreamed=%d",
             session_id, total_count, last_dreamed,
