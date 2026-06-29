@@ -2962,16 +2962,19 @@ async def _pg_dream_run(args: str, context: CommandContext) -> CommandResult:
 
     import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        dream_result = loop.run_until_complete(
+        dream_result = asyncio.get_event_loop().run_until_complete(
             executor.run_for_session(
                 context.session_id,
                 cwd=cwd,
                 project_name=project_name,
             )
         )
-    except RuntimeError:
-        dream_result = {"status": "error", "errors": ["no event loop available"]}
+    except Exception:
+        dream_result = await executor.run_for_session(
+            context.session_id,
+            cwd=cwd,
+            project_name=project_name,
+        )
 
     result_text = (
         f"Dream complete ({dream_result.get('status', '?')}):\n"
