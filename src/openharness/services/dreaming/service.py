@@ -159,16 +159,45 @@ class DreamingExecutor:
         # 7. Parse JSON response
         extraction_data = self._parse_response(child_output, result)
 
-        # 8. Cross‑session reinforcement: find similar existing knowledge
-        #    and merge "create" actions into "reinforce" when a match is found.
-        if extraction_data:
-            await self._cross_session_reinforce(session_id, extraction_data, result)
+        # Steps 8‑10 (reinforce + extractions + embedding backfill) wrapped
+        # in a timeout so stuck API calls don't leave orphaned running rows.
+        try:
+            async with asyncio.timeout(_CHILD_TASK_TIMEOUT):
+                # 8. Cross‑session reinforcement
+                if extraction_data:
+                    await self._cross_session_reinforce(session_id, extraction_data, result)
 
-        # 9. Process extractions
-        if extraction_data:
-            self._process_extractions(session_id, extraction_data, result)
+                # 9. Process extractions
+                if extraction_data:
+                    self._process_extractions(session_id, extraction_data, result)
 
-        # 10. Update dreamed_messages high-water mark
+                # 10. Backfill embeddings for any newly-created units
+                if extraction_data and result.get("created", 0) > 0:
+                    try:
+                        from openharness.auth.storage import load_credential
+                        from openharness.services.embedding import EmbeddingService
+                        api_key = load_credential("openai", "api_key")
+                        if api_key:
+                            emb_svc = EmbeddingService(
+                                backend="openai",
+                                model="text-embedding-3-small",
+                                api_key=api_key,
+                            )
+                            await self._backfill_new_embeddings(session_id, emb_svc)
+                    except Exception:
+                        log.exception("Embedding backfill failed for session %s", session_id)
+        except asyncio.TimeoutError:
+            log.error("Dream post‑processing timed out for session %s", session_id)
+            result["errors"].append("post‑processing timeout")
+            self._finish_dream_run(dream_run_id, "timeout")
+            return result
+        except Exception:
+            log.exception("Dream post‑processing crashed for session %s", session_id)
+            result["errors"].append("post‑processing error")
+            self._finish_dream_run(dream_run_id, "error")
+            return result
+
+        # 11. Update dreamed_messages high-water mark
         self._update_dreamed_messages(session_id)
 
         # 11. Record result
@@ -328,7 +357,7 @@ class DreamingExecutor:
     ) -> None:
         """For each 'create' extraction, check if similar knowledge exists
         across all sessions via embedding similarity.  If a match is found
-        (cosine similarity >= 0.85), convert the action to 'reinforce' so
+        (cosine similarity >= 0.60), convert the action to 'reinforce' so
         the existing unit gets new evidence rather than creating a duplicate."""
         try:
             from openharness.services.knowledge_store import get_knowledge_store
@@ -356,12 +385,12 @@ class DreamingExecutor:
                     top_k=3,
                     types=[unit_type],
                     min_confidence=0.3,
-                    threshold=0.85,
+                    threshold=0.60,
                 )
             except Exception:
                 continue
 
-            if matches and matches[0].similarity and matches[0].similarity >= 0.85:
+            if matches and matches[0].similarity and matches[0].similarity >= 0.60:
                 best = matches[0]
                 if best.source_session_id != session_id:
                     # Found similar knowledge from another session — reinforce
@@ -419,6 +448,44 @@ class DreamingExecutor:
         import hashlib
         normalized = " ".join(content.split())
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    async def _backfill_new_embeddings(
+        self, session_id: str, emb_svc: "EmbeddingService",
+    ) -> int:
+        """Generate embeddings for knowledge units that have NULL embedding.
+
+        Called after _process_extractions to fill embeddings for new units
+        inserted by the dreaming pipeline (which bypasses KnowledgeStore).
+        Returns the number of rows backfilled.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """SELECT id, title, content FROM oh_knowledge
+               WHERE embedding IS NULL AND archived = FALSE
+               AND source_session_id = %s""",
+            (session_id,),
+        )
+        null_rows = cur.fetchall()
+        if not null_rows:
+            return 0
+
+        count = 0
+        for kid, title, content in null_rows:
+            text = f"{title}: {content}"
+            try:
+                vec = await emb_svc.embed_one(text)
+            except Exception:
+                log.exception("Failed to embed knowledge unit id=%s", kid)
+                continue
+            cur.execute(
+                "UPDATE oh_knowledge SET embedding = %s WHERE id = %s",
+                (vec, kid),
+            )
+            count += 1
+        self._conn.commit()
+        if count:
+            log.info("Embedding backfill: %d rows for session %s", count, session_id)
+        return count
 
     def _upsert_create(
         self, session_id: str, unit: dict[str, Any], result: dict[str, Any]
