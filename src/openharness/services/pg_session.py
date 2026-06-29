@@ -520,14 +520,20 @@ class PostgresSessionBackend:
                     session_id, message_count, last_dreamed,
                 )
                 loop = self._dreaming_event_loop
-                asyncio.ensure_future(
-                    executor.run_for_session(
-                        session_id,
-                        cwd=cwd_str,
-                        project_name=project_name,
-                    ),
-                    loop=loop,
-                )
+
+                async def _safe_run() -> None:
+                    try:
+                        await executor.run_for_session(
+                            session_id,
+                            cwd=cwd_str,
+                            project_name=project_name,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Dream task crashed for session=%s", session_id
+                        )
+
+                asyncio.ensure_future(_safe_run(), loop=loop)
 
     def _maybe_trigger_dream(
         self, session_id: str, message_count: int, prev_count: int,
@@ -586,14 +592,20 @@ class PostgresSessionBackend:
         )
 
         loop = self._dreaming_event_loop
-        asyncio.ensure_future(
-            executor.run_for_session(
-                session_id,
-                cwd=cwd_str,
-                project_name=project_name,
-            ),
-            loop=loop,
-        )
+
+        async def _safe_run() -> None:
+            try:
+                await executor.run_for_session(
+                    session_id,
+                    cwd=cwd_str,
+                    project_name=project_name,
+                )
+            except Exception:
+                log.exception(
+                    "Dream task crashed for session=%s", session_id
+                )
+
+        asyncio.ensure_future(_safe_run(), loop=loop)
 
     # ── SessionBackend Protocol ─────────────────────────────────────────────
 
