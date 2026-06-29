@@ -662,8 +662,11 @@ class PostgresSessionBackend:
             current_epoch = existing[1] if existing else 0
             total_tokens = usage.total_tokens
 
-            # 2. Detect epoch boundary (compaction or /clear shrank the list)
-            if existing and prev_count > 0 and new_count <= prev_count:
+            # 2. Detect epoch boundary — only when the list genuinely shrunk
+            #    (compaction or /clear reduced the turn count).  Equality
+            #    (e.g. after a dream run paused/resumed the engine) is NOT
+            #    a boundary — nothing changed.
+            if existing and prev_count > 0 and new_count < prev_count:
                 current_epoch += 1
                 prev_count = 0  # re-insert all messages in new epoch
 
