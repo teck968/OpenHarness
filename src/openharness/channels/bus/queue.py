@@ -3,6 +3,8 @@
 import asyncio
 
 from openharness.channels.bus.events import InboundMessage, OutboundMessage
+import logging
+logger = logging.getLogger(__name__)
 
 
 class MessageBus:
@@ -19,6 +21,13 @@ class MessageBus:
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
+        # GHOST_DIAG: capture caller of publish_inbound
+        import traceback as _tb
+        logger.info(
+            "GHOST_DIAG: publish_inbound called chat_id=%s stack=%s",
+            msg.chat_id,
+            " | ".join(f.name for f in _tb.extract_stack()[:-1][-4:]),
+        )
         await self.inbound.put(msg)
 
     async def consume_inbound(self) -> InboundMessage:

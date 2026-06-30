@@ -133,6 +133,7 @@ class BaseChannel(ABC):
             session_key_override=session_key,
         )
 
+        logger.info("BASE_DIAG: publish_inbound chat_id=%s content=%r", msg.chat_id, msg.content[:80])
         await self.bus.publish_inbound(msg)
 
     @property

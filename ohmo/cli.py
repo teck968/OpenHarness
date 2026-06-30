@@ -750,7 +750,9 @@ async def _run_dream_sweep(workspace: str | None) -> None:
            FROM oh_sessions s
            LEFT JOIN oh_dreamed_messages dm ON dm.session_id = s.session_id
            WHERE (s.ended_at IS NOT NULL
-                  OR (s.ended_at IS NULL AND s.updated_at < now() - interval '3 hours'))
+                  OR (s.ended_at IS NULL
+                      AND (SELECT MAX(m.created_at) FROM oh_messages m
+                           WHERE m.session_id = s.session_id) < now() - interval '3 hours'))
              AND (dm.session_id IS NULL
                   OR s.message_count - COALESCE(
                       (SELECT COUNT(*) FROM oh_messages

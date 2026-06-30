@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import os.path
+import time
 import signal
 import subprocess
 import sys
@@ -75,6 +76,10 @@ class OhmoGatewayService:
     @property
     def pid_file(self) -> Path:
         return get_workspace_root(self._workspace) / "gateway.pid"
+
+    @property
+    def lock_file(self) -> Path:
+        return get_workspace_root(self._workspace) / "gateway.lock"
 
     @property
     def log_file(self) -> Path:
@@ -230,7 +235,37 @@ class OhmoGatewayService:
         finally:
             path.unlink(missing_ok=True)
 
+    def _acquire_lock(self) -> bool:
+        """Try to acquire the gateway lock file. Returns True if acquired, False if stale.
+        The lock file contains a heartbeat timestamp. If an existing lock is recent
+        (<15s old), another gateway is assumed running and startup is refused.
+        """
+        if self.lock_file.exists():
+            try:
+                data = json.loads(self.lock_file.read_text(encoding="utf-8"))
+                age = time.time() - data.get("heartbeat", 0)
+                if age < 15.0:
+                    logger.warning(
+                        "ohmo gateway lock held by pid=%s age=%0.1fs — refusing duplicate start",
+                        data.get("pid", "unknown"), age,
+                    )
+                    return False
+                logger.info("ohmo gateway stale lock age=%0.1fs — overwriting", age)
+            except Exception:
+                logger.info("ohmo gateway corrupt lock file — overwriting")
+        self._write_lock()
+        return True
+
+    def _write_lock(self) -> None:
+        self.lock_file.write_text(
+            json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "host": "wsl"}),
+            encoding="utf-8",
+        )
+
     async def run_foreground(self) -> int:
+        if not self._acquire_lock():
+            return 1
+
         self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
         self.write_state(running=True)
         bridge_task = asyncio.create_task(self._bridge.run(), name="ohmo-gateway-bridge")
@@ -257,6 +292,7 @@ class OhmoGatewayService:
         async def _state_heartbeat() -> None:
             while not stop_event.is_set():
                 self.write_state(running=True)
+                self._write_lock()
                 await asyncio.sleep(5.0)
 
         state_task = asyncio.create_task(_state_heartbeat(), name="ohmo-gateway-state")
@@ -285,6 +321,7 @@ class OhmoGatewayService:
             await self._manager.stop_all()
             self.write_state(running=False)
             self.pid_file.unlink(missing_ok=True)
+            self.lock_file.unlink(missing_ok=True)
             self._stop_event = None
         if self._restart_requested:
             self._exec_restart()

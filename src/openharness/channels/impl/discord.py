@@ -182,6 +182,7 @@ class DiscordChannel(BaseChannel):
                 # Register slash commands now (guild-scoped for instant visibility)
                 await self._register_slash_commands()
             elif op == 0 and event_type == "MESSAGE_CREATE":
+                logger.info("DISCORD_DIAG: MESSAGE_CREATE msg_id=%s channel=%s content=%r", payload.get("id"), payload.get("channel_id"), (payload.get("content") or "")[:80])
                 await self._handle_message_create(payload)
             elif op == 0 and event_type == "INTERACTION_CREATE":
                 await self._handle_interaction_create(payload)
